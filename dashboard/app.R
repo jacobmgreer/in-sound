@@ -1,0 +1,1089 @@
+library(shiny)
+library(bslib)
+library(DT)
+library(duckdb)
+library(dplyr)
+library(scales)
+library(htmltools)
+
+# =============================================================================
+# CONFIGURATION & PATHS
+# =============================================================================
+
+options(bslib.precompiled = TRUE)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Mutable data location. Local dev: "data" or "../data" if run from dashboard/.
+# In Shinylive this stays "data" and the parquet files are downloaded into the
+# webR virtual filesystem at runtime from the deployed site.
+DATA_DIR <- "../data"
+
+CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sound_content.parquet")
+CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sound_creator.parquet")
+FILTER_DEBOUNCE_MS <- 400
+
+MACRO_DIR <- "macros"
+
+# =============================================================================
+# ENGINE STATE (populated by init_engine() once data is available)
+# =============================================================================
+
+DECADE_BITS       <- integer()
+ROLE_BITS         <- integer()
+LANG_BITS         <- integer()
+ORIGIN_BITS       <- integer()
+GRAPH_BITS        <- integer()
+SOURCE_ID_TO_NAME <- integer()
+CONTENT_SCHEMA    <- NULL
+CREATOR_SCHEMA    <- NULL
+FILTER_CHOICES    <- list(
+  ok = FALSE, decades = numeric(),
+  sources = setNames(integer(0), character(0)),
+  source_ids = integer(),
+  langs = character(), origins = character(), roles = character()
+)
+NC_CON <- NULL
+
+# =============================================================================
+# LOW-LEVEL HELPERS
+# =============================================================================
+
+sql_quote <- function(x) sprintf("'%s'", gsub("'", "''", as.character(x), fixed = TRUE))
+sql_int_in <- function(v) paste0("(", paste(as.integer(v), collapse = ", "), ")")
+sql_in     <- function(v) paste0("(", paste(sql_quote(v), collapse = ", "), ")")
+
+open_con <- function() {
+  con <- dbConnect(duckdb(), dbdir = ":memory:", read_only = FALSE)
+  dbExecute(con, "PRAGMA threads=6;")
+  dbExecute(con, "SET preserve_insertion_order = false;")
+  con
+}
+
+safe_query <- function(con, sql, fallback = data.frame()) {
+  tryCatch({
+    df <- dbGetQuery(con, sql)
+    for (col in names(df)) {
+      if (inherits(df[[col]], "integer64")) df[[col]] <- as.numeric(df[[col]])
+    }
+    df
+  }, error = function(e) {
+    message("[nitrate-dash] ", conditionMessage(e))
+    fallback
+  })
+}
+
+run_sql <- function(con, sql) {
+  safe_query(con, sql)
+}
+
+check_files <- function() {
+  files <- c(CONTENT_PARQUET(), CREATOR_PARQUET())
+  basename(files[!file.exists(files)])
+}
+
+pick_col <- function(cols, candidates, label) {
+  hit <- candidates[candidates %in% cols]
+  if (!length(hit)) {
+    stop(sprintf("Could not find %s. Tried: %s.", label, paste(candidates, collapse = ", ")), call. = FALSE)
+  }
+  hit[[1]]
+}
+
+parquet_schema <- function(con, path) {
+  dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet(%s)", sql_quote(file.path(path))))
+}
+
+resolve_export_schema <- function(info, entity_label) {
+  cols <- info$column_name
+  source_col <- pick_col(cols, "source", sprintf("%s source column", entity_label))
+  source_type <- info$column_type[info$column_name == source_col][[1]]
+
+  list(
+    id        = pick_col(cols, "big", sprintf("%s ID column", entity_label)),
+    decades   = pick_col(cols, "decades", sprintf("%s decade bitmask", entity_label)),
+    source    = source_col,
+    source_is_int = grepl("int|serial", source_type, ignore.case = TRUE),
+    langs     = pick_col(cols, "langs", sprintf("%s language bitmask", entity_label)),
+    origins   = pick_col(cols, "origins", sprintf("%s origin bitmask", entity_label)),
+    roles     = pick_col(cols, "roles", sprintf("%s role bitmask", entity_label)),
+    graph_col = pick_col(cols, "comp", sprintf("%s graph bitmask", entity_label))
+  )
+}
+
+# =============================================================================
+# MACRO REGISTRATION & DYNAMIC BIT LOADING
+# =============================================================================
+
+register_all_macros <- function(con) {
+  macro_files <- list.files(MACRO_DIR, pattern = "\\.sql$", full.names = TRUE)
+  for (f in macro_files) {
+    sql_text <- paste(readLines(f, warn = FALSE), collapse = "\n")
+    if (nzchar(trimws(sql_text))) {
+      dbExecute(con, sql_text)
+    }
+  }
+}
+
+load_bits_from_macro <- function(con, macro_name) {
+  df <- dbGetQuery(con, sprintf("SELECT bit, value FROM %s() ORDER BY bit DESC", macro_name))
+  setNames(as.integer(df$bit), as.character(df$value))
+}
+
+dim_rows_sql <- function(bits, numeric_values = FALSE) {
+  vapply(seq_along(bits), function(i) {
+    value <- names(bits)[[i]]
+    value_sql <- if (numeric_values) as.character(value) else sql_quote(value)
+    sprintf("(%d, %s)", as.integer(bits[[i]]), value_sql)
+  }, character(1), USE.NAMES = FALSE) |> paste(collapse = ", ")
+}
+
+create_dimension_table <- function(con, table_name, bits, numeric_values = FALSE) {
+  dbExecute(con, sprintf(
+    "CREATE OR REPLACE TABLE %s AS SELECT bit, value FROM (VALUES %s) AS t(bit, value)",
+    table_name, dim_rows_sql(bits, numeric_values)
+  ))
+}
+
+register_dimension_tables <- function(con) {
+  create_dimension_table(con, "dim_decade", DECADE_BITS, numeric_values = TRUE)
+  create_dimension_table(con, "dim_role", ROLE_BITS)
+  create_dimension_table(con, "dim_lang", LANG_BITS)
+  create_dimension_table(con, "dim_origin", ORIGIN_BITS)
+
+  source_rows <- vapply(seq_along(SOURCE_ID_TO_NAME), function(i) {
+    sprintf("(%d, %s)", as.integer(SOURCE_ID_TO_NAME[[i]]), sql_quote(names(SOURCE_ID_TO_NAME)[[i]]))
+  }, character(1), USE.NAMES = FALSE) |> paste(collapse = ", ")
+
+  dbExecute(con, sprintf(
+    "CREATE OR REPLACE TABLE dim_source AS SELECT bit, value FROM (VALUES %s) AS t(bit, value)",
+    source_rows
+  ))
+}
+
+bit_is_set_join_sql <- function(bitmask_col, alias = NULL) {
+  col <- if (is.null(alias)) bitmask_col else paste0(alias, ".", bitmask_col)
+  sprintf("(COALESCE(%s, 0)::BIGINT & (1::BIGINT << d.bit)) <> 0", col)
+}
+
+# =============================================================================
+# STARTUP — filter dropdown choices (requires parquet files present)
+# =============================================================================
+
+distinct_bitmap_values <- function(con, parquet_path, bitmask_col, dim_table) {
+  sql <- sprintf(
+    r"(
+      SELECT DISTINCT d.value AS value
+      FROM read_parquet('%s') p
+      JOIN %s d ON %s
+      ORDER BY value
+    )",
+    parquet_path, dim_table, bit_is_set_join_sql(bitmask_col, "p")
+  )
+  safe_query(con, sql)
+}
+
+load_filter_choices <- function() {
+  empty_sources <- setNames(integer(0), character(0))
+  if (length(check_files()) > 0) {
+    return(list(
+      ok = FALSE, decades = numeric(), sources = empty_sources,
+      source_ids = integer(), langs = character(), origins = character(), roles = character()
+    ))
+  }
+
+  con <- open_con()
+  on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  register_dimension_tables(con)
+
+  ddf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$decades, "dim_decade")
+  ldf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$langs, "dim_lang")
+  odf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$origins, "dim_origin")
+  rdf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$roles, "dim_role")
+
+  source_col <- CONTENT_SCHEMA$source
+  sdf_sql <- sprintf(
+    r"(
+      SELECT DISTINCT p.%s AS source_id,
+             COALESCE(d.value, 'Source ' || CAST(p.%s AS VARCHAR)) AS source
+      FROM read_parquet(%s) p
+      LEFT JOIN dim_source d ON p.%s = d.bit
+      WHERE p.%s IS NOT NULL
+      ORDER BY source
+    )",
+    source_col, source_col, sql_quote(CONTENT_PARQUET()), source_col, source_col
+  )
+  sdf <- safe_query(con, sdf_sql)
+
+  source_ids <- if (nrow(sdf) > 0) as.integer(sdf$source_id) else integer()
+  source_labels <- if (nrow(sdf) > 0) as.character(sdf$source) else character()
+  sources <- setNames(source_ids, source_labels)
+
+  list(
+    ok         = TRUE,
+    decades    = if (nrow(ddf) > 0) sort(as.numeric(ddf$value)) else as.numeric(names(DECADE_BITS)),
+    sources    = sources,
+    source_ids = source_ids,
+    langs      = if (nrow(ldf) > 0) as.character(ldf$value) else names(LANG_BITS),
+    origins    = if (nrow(odf) > 0) as.character(odf$value) else names(ORIGIN_BITS),
+    roles      = if (nrow(rdf) > 0) as.character(rdf$value) else names(ROLE_BITS)
+  )
+}
+
+build_decade_choices <- function() {
+  ch <- c("All Decades" = "")
+  if (length(FILTER_CHOICES$decades) > 0) {
+    ch <- c(
+      ch,
+      setNames(as.character(FILTER_CHOICES$decades), paste0(FILTER_CHOICES$decades, "s"))
+    )
+  }
+  ch
+}
+
+# =============================================================================
+# ENGINE INITIALIZATION — called once data files are guaranteed present.
+# Populates the module-level state via <<- so all query builders below work
+# unchanged whether running locally or in Shinylive.
+# =============================================================================
+
+init_engine <- function() {
+  schema_con <- open_con()
+  register_all_macros(schema_con)
+
+  DECADE_BITS       <<- load_bits_from_macro(schema_con, "get_decade_mapping")
+  ROLE_BITS         <<- load_bits_from_macro(schema_con, "get_role_mapping")
+  LANG_BITS         <<- load_bits_from_macro(schema_con, "get_language_mapping")
+  ORIGIN_BITS       <<- load_bits_from_macro(schema_con, "get_origin_mapping")
+  GRAPH_BITS        <<- load_bits_from_macro(schema_con, "get_comp_mapping")
+  SOURCE_ID_TO_NAME <<- load_bits_from_macro(schema_con, "get_source_mapping")
+
+  CONTENT_SCHEMA <<- resolve_export_schema(parquet_schema(schema_con, CONTENT_PARQUET()), "content")
+  CREATOR_SCHEMA <<- resolve_export_schema(parquet_schema(schema_con, CREATOR_PARQUET()), "creator")
+
+  dbDisconnect(schema_con, shutdown = TRUE)
+
+  FILTER_CHOICES <<- load_filter_choices()
+
+  con <- open_con()
+  register_dimension_tables(con)
+
+  message("[nitrate-dash] Loading parquets into DuckDB cache…")
+  dbExecute(con, sprintf("CREATE TABLE nc_content AS SELECT * FROM read_parquet('%s')", CONTENT_PARQUET()))
+  dbExecute(con, sprintf("CREATE TABLE nc_creator AS SELECT * FROM read_parquet('%s')", CREATOR_PARQUET()))
+  message("[nitrate-dash] Bitmap cache ready.")
+
+  NC_CON <<- con
+  invisible(TRUE)
+}
+
+# =============================================================================
+# BITMASK FILTER BUILDERS
+# =============================================================================
+
+selected_bitmask_sql <- function(values, bits) {
+  values <- values[!is.na(values) & as.character(values) != ""]
+  if (!length(values)) return(NULL)
+
+  positions <- bits[as.character(values)]
+  if (length(positions) == 0L || any(is.na(positions))) return(NULL)
+
+  sprintf("%.0f", sum(2^as.numeric(positions)))
+}
+
+build_bitmask_clause <- function(values, bitmask_col, bits) {
+  mask_sql <- selected_bitmask_sql(values, bits)
+  if (is.null(mask_sql)) return("")
+  sprintf("AND ((COALESCE(%s, 0)::BIGINT & %s::BIGINT) <> 0)", bitmask_col, mask_sql)
+}
+
+get_decade_values <- function(inp) {
+  if (inp$filter_decade_from == "" || inp$filter_decade_to == "") {
+    return(FILTER_CHOICES$decades)
+  }
+
+  from <- suppressWarnings(as.integer(inp$filter_decade_from))
+  to   <- suppressWarnings(as.integer(inp$filter_decade_to))
+  if (is.na(from) || is.na(to)) return(FILTER_CHOICES$decades)
+  if (from > to) { tmp <- from; from <- to; to <- tmp }
+  seq(from, to, by = 10)
+}
+
+get_decade_values_sql <- function(inp) {
+  paste(sprintf("(%d)", get_decade_values(inp)), collapse = ", ")
+}
+
+build_content_decade_clause <- function(inp, schema = CONTENT_SCHEMA) {
+  build_bitmask_clause(get_decade_values(inp), schema$decades, DECADE_BITS)
+}
+
+build_creator_decade_clause <- function(inp, schema = CREATOR_SCHEMA) {
+  build_bitmask_clause(get_decade_values(inp), schema$decades, DECADE_BITS)
+}
+
+build_lang_clause <- function(inp, schema)   { build_bitmask_clause(inp$filter_langs, schema$langs, LANG_BITS) }
+build_origin_clause <- function(inp, schema) { build_bitmask_clause(inp$filter_origins, schema$origins, ORIGIN_BITS) }
+build_role_clause <- function(inp, schema)   { build_bitmask_clause(inp$filter_roles, schema$roles, ROLE_BITS) }
+
+build_source_clause <- function(inp, schema) {
+  selected <- inp$filter_sources
+  if (!length(selected)) return("AND 1=0")
+
+  selected <- as.integer(selected)
+  selected <- selected[!is.na(selected)]
+  if (!length(selected)) return("AND 1=0")
+  if (length(selected) >= length(FILTER_CHOICES$source_ids)) return("")
+
+  sprintf("AND %s IN %s", schema$source, sql_int_in(selected))
+}
+
+# =============================================================================
+# CTE BUILDERS
+# =============================================================================
+
+graph_columns <- function(schema) {
+  schema$graph_col
+}
+
+entity_cte <- function(table_name, id_col, schema, clauses) {
+  cols <- unique(c(
+    id_col, schema$source, schema$decades, schema$langs,
+    schema$origins, schema$roles, graph_columns(schema)
+  ))
+  sprintf(
+    "filtered_%s AS (SELECT %s FROM nc_%s WHERE 1=1 %s)",
+    table_name, paste(cols, collapse = ", "), table_name, paste(clauses, collapse = " ")
+  )
+}
+
+build_content_cte <- function(inp) {
+  entity_cte(
+    "content", CONTENT_SCHEMA$id, CONTENT_SCHEMA,
+    c(
+      build_source_clause(inp, CONTENT_SCHEMA),
+      build_content_decade_clause(inp),
+      build_lang_clause(inp, CONTENT_SCHEMA),
+      build_origin_clause(inp, CONTENT_SCHEMA),
+      build_role_clause(inp, CONTENT_SCHEMA)
+    )
+  )
+}
+
+build_creator_cte <- function(inp) {
+  entity_cte(
+    "creator", CREATOR_SCHEMA$id, CREATOR_SCHEMA,
+    c(
+      build_source_clause(inp, CREATOR_SCHEMA),
+      build_creator_decade_clause(inp),
+      build_lang_clause(inp, CREATOR_SCHEMA),
+      build_origin_clause(inp, CREATOR_SCHEMA),
+      build_role_clause(inp, CREATOR_SCHEMA)
+    )
+  )
+}
+
+# =============================================================================
+# QUERY FUNCTIONS
+# =============================================================================
+
+graph_match_expr <- function(schema, graph_name, alias = NULL) {
+  prefix <- if (is.null(alias)) "" else paste0(alias, ".")
+  sprintf(
+    "((COALESCE(%s%s, 0)::BIGINT & (1::BIGINT << %d)) <> 0)",
+    prefix, schema$graph_col, GRAPH_BITS[[graph_name]]
+  )
+}
+
+query_overview <- function(con, inp) {
+  content_base    <- graph_match_expr(CONTENT_SCHEMA, "base")
+  content_clean   <- graph_match_expr(CONTENT_SCHEMA, "clean")
+  content_disc    <- graph_match_expr(CONTENT_SCHEMA, "discovery")
+  creator_base    <- graph_match_expr(CREATOR_SCHEMA, "base")
+  creator_clean   <- graph_match_expr(CREATOR_SCHEMA, "clean")
+  creator_disc    <- graph_match_expr(CREATOR_SCHEMA, "discovery")
+
+  c_id <- CONTENT_SCHEMA$id
+  p_id <- CREATOR_SCHEMA$id
+
+  sql <- sprintf(
+    r"(
+      WITH %s,
+           %s,
+           cnt AS (
+             SELECT
+               COUNT(DISTINCT %s) AS total_content,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS base_content,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS clean_content,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS disc_content
+             FROM filtered_content
+           ),
+           ppl AS (
+             SELECT
+               COUNT(DISTINCT %s) AS total_creator,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS base_creator,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS clean_creator,
+               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS disc_creator
+             FROM filtered_creator
+           )
+      SELECT * FROM cnt CROSS JOIN ppl
+    )",
+    build_content_cte(inp),
+    build_creator_cte(inp),
+    c_id, content_base, c_id, content_clean, c_id, content_disc, c_id,
+    p_id, creator_base, p_id, creator_clean, p_id, creator_disc, p_id
+  )
+
+  run_sql(con, sql)
+}
+
+query_by_bit_dimension <- function(con, inp, entity, dim_table, bitmask_col, order_by) {
+  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
+  id_col <- schema$id
+  total_col <- paste0("total_", entity)
+  table <- paste0("filtered_", entity)
+  base_expr <- graph_match_expr(schema, "base", "f")
+  clean_expr <- graph_match_expr(schema, "clean", "f")
+  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
+
+  sql <- sprintf(
+    r"(
+      WITH %s
+      SELECT
+        d.value AS grouping,
+        COUNT(DISTINCT f.%s) AS %s,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS base_matched,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS clean_matched,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS disc_matched,
+        COUNT(DISTINCT CASE WHEN NOT (%s) THEN f.%s END) AS unmatched
+      FROM %s f
+      JOIN %s d ON %s
+      GROUP BY d.value
+      ORDER BY %s
+    )",
+    cte,
+    id_col, total_col,
+    base_expr, id_col,
+    clean_expr, id_col,
+    disc_expr, id_col,
+    disc_expr, id_col,
+    table,
+    dim_table, bit_is_set_join_sql(bitmask_col, "f"),
+    order_by
+  )
+
+  run_sql(con, sql)
+}
+
+query_content_by_role   <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_role",   CONTENT_SCHEMA$roles,   "total_content DESC")
+query_content_by_lang   <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_lang",   CONTENT_SCHEMA$langs,   "total_content DESC")
+query_content_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_origin", CONTENT_SCHEMA$origins, "total_content DESC")
+query_creator_by_role   <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_role",   CREATOR_SCHEMA$roles,   "total_creator DESC")
+query_creator_by_lang   <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_lang",   CREATOR_SCHEMA$langs,   "total_creator DESC")
+query_creator_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_origin", CREATOR_SCHEMA$origins, "total_creator DESC")
+
+query_by_decade <- function(con, inp, entity) {
+  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
+  id_col <- schema$id
+  total_col <- paste0("total_", entity)
+  table <- paste0("filtered_", entity)
+  base_expr <- graph_match_expr(schema, "base", "f")
+  clean_expr <- graph_match_expr(schema, "clean", "f")
+  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
+  dec_values <- get_decade_values_sql(inp)
+
+  sql <- sprintf(
+    r"(
+      WITH %s,
+           all_dec AS (SELECT decade FROM (VALUES %s) t(decade)),
+           dec_exp AS (
+             SELECT
+               d.value AS decade,
+               f.%s AS entity_id,
+               %s AS is_base,
+               %s AS is_clean,
+               %s AS is_discovery
+             FROM %s f
+             JOIN dim_decade d ON %s
+           )
+      SELECT
+        ad.decade,
+        COUNT(DISTINCT de.entity_id) AS %s,
+        COUNT(DISTINCT CASE WHEN de.is_base THEN de.entity_id END) AS base_matched,
+        COUNT(DISTINCT CASE WHEN de.is_clean THEN de.entity_id END) AS clean_matched,
+        COUNT(DISTINCT CASE WHEN de.is_discovery THEN de.entity_id END) AS disc_matched,
+        COUNT(DISTINCT CASE WHEN NOT de.is_discovery THEN de.entity_id END) AS unmatched
+      FROM all_dec ad
+      LEFT JOIN dec_exp de USING (decade)
+      GROUP BY ad.decade
+      ORDER BY ad.decade
+    )",
+    cte,
+    dec_values,
+    id_col,
+    base_expr, clean_expr, disc_expr,
+    table, bit_is_set_join_sql(schema$decades, "f"),
+    total_col
+  )
+
+  run_sql(con, sql)
+}
+
+query_content_by_decade <- function(con, inp) query_by_decade(con, inp, "content")
+query_creator_by_decade <- function(con, inp) query_by_decade(con, inp, "creator")
+
+query_by_source <- function(con, inp, entity) {
+  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
+  id_col <- schema$id
+  total_col <- paste0("total_", entity)
+  table <- paste0("filtered_", entity)
+  base_expr <- graph_match_expr(schema, "base", "f")
+  clean_expr <- graph_match_expr(schema, "clean", "f")
+  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
+
+  source_ref <- paste0("f.", schema$source)
+  source_select <- sprintf("COALESCE(s.value, 'Source ' || CAST(%s AS VARCHAR)) AS source", source_ref)
+  source_join <- sprintf("LEFT JOIN dim_source s ON %s = s.bit", source_ref)
+  group_by_expr <- sprintf("COALESCE(s.value, 'Source ' || CAST(%s AS VARCHAR))", source_ref)
+
+  sql <- sprintf(
+    r"(
+      WITH %s
+      SELECT
+        %s,
+        COUNT(DISTINCT f.%s) AS %s,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS base_matched,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS clean_matched,
+        COUNT(DISTINCT CASE WHEN %s THEN f.%s END) AS disc_matched,
+        COUNT(DISTINCT CASE WHEN NOT (%s) THEN f.%s END) AS unmatched
+      FROM %s f
+      %s
+      GROUP BY %s
+      ORDER BY %s DESC
+    )",
+    cte,
+    source_select,
+    id_col, total_col,
+    base_expr, id_col,
+    clean_expr, id_col,
+    disc_expr, id_col,
+    disc_expr, id_col,
+    table,
+    source_join,
+    group_by_expr,
+    total_col
+  )
+
+  run_sql(con, sql)
+}
+
+query_content_by_source <- function(con, inp) query_by_source(con, inp, "content")
+query_creator_by_source <- function(con, inp) query_by_source(con, inp, "creator")
+
+pct_fmt <- function(num, denom) {
+  ifelse(is.na(denom) | denom == 0, "—", sprintf("%.1f%%", 100 * num / denom))
+}
+
+# ── Global DT Formatter ───────────────────────────────────────────────────────
+fmt_dt <- function(df, first_col_name = "Grouping", caption = NULL) {
+  if (nrow(df) == 0) return(DT::datatable(df))
+
+  sketch <- htmltools::withTags(table(
+    class = "display",
+    thead(
+      tr(
+        th(rowspan = 2, first_col_name),
+        th(rowspan = 2, "Total", style = "text-align: right;"),
+        th(colspan = 2, "Base", style = "text-align: center;"),
+        th(colspan = 2, "Clean", style = "text-align: center;"),
+        th(colspan = 2, "Discovery", style = "text-align: center;"),
+        th(rowspan = 2, "Unmatched", style = "text-align: right;")
+      ),
+      tr(
+        lapply(c("%", "Matched", "%", "Matched", "%", "Matched"), function(x) {
+          th(x, style = "text-align: right;")
+        })
+      )
+    )
+  ))
+
+  single_page <- nrow(df) <= 30
+
+  dt_obj <- DT::datatable(
+    df,
+    caption = caption,
+    container = sketch,
+    rownames = FALSE,
+    class = "compact stripe hover",
+    options = list(
+      pageLength = 30,
+      scrollX = TRUE,
+      paging = !single_page,
+      searching = !single_page,
+      info = !single_page,
+      dom = (if (single_page) "t" else "frtip"),
+      columnDefs = list(
+        list(className = "dt-body-right", targets = c(1, 2, 3, 4, 5, 6, 7, 8)),
+        list(className = "dt-body-left", targets = c(0))
+      )
+    )
+  )
+
+  cols_to_format <- c("total_content", "total_creator",
+                      "base_matched", "clean_matched", "disc_matched",
+                      "unmatched")
+  target_cols <- intersect(cols_to_format, colnames(df))
+  if (length(target_cols) > 0) {
+    dt_obj <- DT::formatCurrency(dt_obj, columns = target_cols, currency = "", digits = 0)
+  }
+
+  dt_obj
+}
+
+ov_card <- function(swatch_color, title, subtitle, total_val,
+                    matched_n = NULL, matched_denom = NULL,
+                    unmatched_n = NULL, extra_note = NULL,
+                    muted = FALSE) {
+  opacity_swatch <- if (muted) "opacity:0.35;" else ""
+  div(class = "card h-100",
+    div(class = "card-body py-2 px-3",
+      div(class = "d-flex align-items-center mb-1",
+        div(style = sprintf(
+          "width:12px;height:12px;border-radius:2px;background:%s;margin-right:6px;flex-shrink:0;%s",
+          swatch_color, opacity_swatch)),
+        (if (muted) strong(class = "text-muted", title) else strong(title))
+      ),
+      div(class = "text-muted", style = "font-size:0.75rem; margin-bottom:4px;", subtitle),
+      (if (muted)
+        h4(class = "mb-1 text-muted", "—")
+      else
+        h4(class = "mb-1", pct_fmt(matched_n, matched_denom))),
+      (if (!is.null(matched_n) && !muted)
+        div(style = "font-size:0.82rem;", comma(matched_n), " connected") else NULL),
+      (if (!is.null(unmatched_n) && !muted)
+        div(style = "font-size:0.82rem;color:#000000;", comma(unmatched_n), " unmatched") else NULL),
+      (if (!is.null(extra_note) && !muted)
+        div(class = "text-muted mt-1", style = "font-size:0.75rem;", extra_note) else NULL)
+    )
+  )
+}
+
+# =============================================================================
+# UI
+# =============================================================================
+
+# The sidebar body is rendered dynamically (uiOutput) because the filter
+# choices can only be known AFTER the parquet files are available at runtime.
+sidebar_panel <- sidebar(
+  width = 290,
+  uiOutput("sidebar_filters")
+)
+
+navbar_css <- paste(
+  ".navbar {",
+  "background-color: #c3cdd7 !important;",
+  "border: none !important;",
+  "border-bottom: 2px solid !important;",
+  "box-shadow: none !important;",
+  "padding: 20px;",
+  "}",
+  sep = "\n")
+
+ui <- page_navbar(
+  title    = "Connected Components",
+  nav_spacer(),
+  theme    = bs_theme(version = 5, bootswatch = "brite") |>
+    bs_add_rules(navbar_css),
+  nav_spacer(),
+  fillable = FALSE,
+  header   = tagList(
+    tags$head(
+      tags$script(src = "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js")
+    ),
+  ),
+  sidebar = sidebar_panel,
+
+  nav_panel("By Source",
+    uiOutput("config_warning"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
+    hr(style = "margin:16px;border:0;"),
+    uiOutput("content_overview_metrics"),
+    uiOutput("by_content_source_header"),
+    DTOutput("tbl_by_content_source"),
+    hr(style = "margin:16px;border:0;"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Creator"),
+    hr(style = "margin:16px;border:0;"),
+    uiOutput("creator_overview_metrics"),
+    uiOutput("by_creator_source_header"),
+    DTOutput("tbl_by_creator_source")
+  ),
+
+  nav_panel("By Role",
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Content Records by Credited Role(s)"),
+    DTOutput("tbl_content_role"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Creator Records by Credited Role(s)"),
+    DTOutput("tbl_creator_role")
+  ),
+
+  nav_panel("By Decade",
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Content Records by Decade"),
+    DTOutput("tbl_content_decade"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Creator Records by Associated Content Decade(s)"),
+    DTOutput("tbl_creator_decade")
+  ),
+
+  nav_panel("By Language",
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Content Records by Language(s)"),
+    DTOutput("tbl_content_lang"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Creator Records by Associated Content Language(s)"),
+    DTOutput("tbl_creator_lang")
+  ),
+
+  nav_panel("By Origin",
+    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Content Records by Origin(s)"),
+    DTOutput("tbl_content_origin"),
+
+    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
+    hr(style = "margin:16px;border:0;"),
+    h5("Creator Records by Associated Content Origin(s)"),
+    DTOutput("tbl_creator_origin")
+  )
+)
+
+# =============================================================================
+# SERVER
+# =============================================================================
+
+server <- function(input, output, session) {
+
+  # data_status: "pending" -> "ok" | "failed"
+  data_status <- reactiveVal("pending")
+
+  # One-time startup: ensure parquet files exist (downloading them from the
+  # deployed site when running under Shinylive/webR), then build the engine.
+  observe({
+    if (length(check_files()) > 0) {
+      # Files are not on the local/virtual filesystem. Build an absolute base
+      # URL for this deployment from the browser's own location — works for
+      # user/org pages (pathname "/") and project pages (pathname "/repo/").
+      base_url <- paste0(
+        session$clientData$url_protocol, "//",
+        session$clientData$url_host,
+        session$clientData$url_pathname
+      )
+      if (!endsWith(base_url, "/")) base_url <- paste0(base_url, "/")
+
+      # message("[nitrate-dash] parquet files not found locally; fetching from ", base_url)
+      # tryCatch(
+      #   download_parquets_from_manifest(base_url),
+      #   error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
+      # )
+    }
+
+    if (length(check_files()) == 0) {
+      tryCatch({
+        init_engine()
+        data_status("ok")
+      }, error = function(e) {
+        message("[nitrate-dash] engine init failed: ", conditionMessage(e))
+        data_status("failed")
+      })
+    } else {
+      data_status("failed")
+    }
+  })
+
+  # Sidebar filters can only be built after FILTER_CHOICES is populated.
+  output$sidebar_filters <- renderUI({
+    req(data_status() == "ok")
+    tagList(
+      h6("Cross-Filters"),
+      hr(style = "margin:6px 0"),
+      selectInput("filter_decade_from", "From Decade",
+                  choices = build_decade_choices(), selected = ""),
+      selectInput("filter_decade_to", "To Decade",
+                  choices = build_decade_choices(), selected = ""),
+      selectInput("filter_langs", "Language(s)",
+                  choices = FILTER_CHOICES$langs, selected = NULL, multiple = TRUE),
+      selectInput("filter_origins", "Origin(s)",
+                  choices = FILTER_CHOICES$origins, selected = NULL, multiple = TRUE),
+      selectInput("filter_roles", "Role(s)",
+                  choices = FILTER_CHOICES$roles, selected = NULL, multiple = TRUE),
+      hr(style = "margin:6px 0"),
+      h6("Source"),
+      checkboxGroupInput("filter_sources", label = NULL,
+                         choices = FILTER_CHOICES$sources,
+                         selected = FILTER_CHOICES$source_ids)
+    )
+  })
+
+  output$config_warning <- renderUI({
+    status <- data_status()
+    if (status == "pending") {
+      return(div(class = "alert alert-info",
+        tags$strong("Loading parquet data… "), "this only happens once per visit."))
+    }
+    if (status == "ok") return(NULL)
+
+    missing <- check_files()
+    div(class = "alert alert-warning",
+      tags$strong("Missing parquet files: "),
+      tags$code(paste(missing, collapse = ", ")), tags$br(),
+      sprintf("Update DATA_DIR at the top of app.R (current: '%s')", DATA_DIR))
+  })
+
+  resolve_input <- function() {
+    list(
+      filter_decade_from = input$filter_decade_from %||% "",
+      filter_decade_to   = input$filter_decade_to %||% "",
+      filter_langs       = input$filter_langs %||% NULL,
+      filter_origins     = input$filter_origins %||% NULL,
+      filter_roles       = input$filter_roles %||% NULL,
+      filter_sources     = input$filter_sources %||% FILTER_CHOICES$source_ids
+    )
+  }
+
+  inp_snap <- debounce(reactive({ resolve_input() }), FILTER_DEBOUNCE_MS)
+
+  run_query <- function(qfn) {
+    req(data_status() == "ok", !is.null(NC_CON))
+    inp <- inp_snap()
+    qfn(NC_CON, inp)
+  }
+
+  output$content_overview_metrics <- renderUI({
+    df <- run_query(query_overview)
+    if (!nrow(df) || all(is.na(unlist(df))))
+      return(p(class = "text-muted", "No data for the selected filters."))
+    r <- df[1, ]
+    fluidRow(
+      column(4, ov_card(
+        "#db3f7d", "Base", "Source Graph",
+        total_val = r$total_content,
+        matched_n = r$base_content,
+        matched_denom = r$total_content,
+        unmatched_n = r$total_content - r$base_content
+      )),
+      column(4, ov_card(
+        "#0ec56a", "Clean", "Cleaned Graph",
+        total_val = r$total_content,
+        matched_n = r$clean_content,
+        matched_denom = r$total_content,
+        unmatched_n = r$total_content - r$clean_content
+      )),
+      column(4, ov_card(
+        "#3885d3", "Discovery", "Proposed Graph",
+        total_val = r$total_content,
+        matched_n = r$disc_content,
+        matched_denom = r$total_content,
+        unmatched_n = r$total_content - r$disc_content
+      ))
+    )
+  })
+
+  output$creator_overview_metrics <- renderUI({
+    df <- run_query(query_overview)
+    if (!nrow(df) || all(is.na(unlist(df))))
+      return(p(class = "text-muted", "No data for the selected filters."))
+    r <- df[1, ]
+    fluidRow(
+      column(4, ov_card(
+        "#db3f7d", "Base", "Source Graph",
+        total_val = r$total_creator,
+        matched_n = r$base_creator,
+        matched_denom = r$total_creator,
+        unmatched_n = r$total_creator - r$base_creator
+      )),
+      column(4, ov_card(
+        "#0ec56a", "Clean", "Cleaned Graph",
+        total_val = r$total_creator,
+        matched_n = r$clean_creator,
+        matched_denom = r$total_creator,
+        unmatched_n = r$total_creator - r$clean_creator
+      )),
+      column(4, ov_card(
+        "#3885d3", "Discovery", "Proposed Graph",
+        total_val = r$total_creator,
+        matched_n = r$disc_creator,
+        matched_denom = r$total_creator,
+        unmatched_n = r$total_creator - r$disc_creator
+      ))
+    )
+  })
+
+  by_creator_source_data <- reactive({ run_query(query_creator_by_source) })
+
+  output$by_creator_source_header <- renderUI({
+    df <- by_creator_source_data()
+    if (!nrow(df)) return(NULL)
+    tagList(br(), h5("By Creator ID Source"))
+  })
+
+  output$tbl_by_creator_source <- renderDT({
+    df <- by_creator_source_data()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+
+    df |>
+      mutate(
+        pct_base  = pct_fmt(base_matched,  total_creator),
+        pct_clean = pct_fmt(clean_matched, total_creator),
+        pct_disc  = pct_fmt(disc_matched,  total_creator)
+      ) |>
+      select(source, total_creator,
+             pct_base, base_matched,
+             pct_clean, clean_matched,
+             pct_disc, disc_matched,
+             unmatched) |>
+      fmt_dt(first_col_name = "Source")
+  })
+
+  by_content_source_data <- reactive({ run_query(query_content_by_source) })
+
+  output$by_content_source_header <- renderUI({
+    df <- by_content_source_data()
+    if (!nrow(df)) return(NULL)
+    tagList(br(), h5("By Content ID Source"))
+  })
+
+  output$tbl_by_content_source <- renderDT({
+    df <- by_content_source_data()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+
+    df |>
+      mutate(
+        pct_base  = pct_fmt(base_matched,  total_content),
+        pct_clean = pct_fmt(clean_matched, total_content),
+        pct_disc  = pct_fmt(disc_matched,  total_content)
+      ) |>
+      select(source, total_content,
+             pct_base, base_matched,
+             pct_clean, clean_matched,
+             pct_disc, disc_matched,
+             unmatched) |>
+      fmt_dt(first_col_name = "Source")
+  })
+
+  content_decade_r  <- reactive({ run_query(query_content_by_decade) })
+  content_lang_r    <- reactive({ run_query(query_content_by_lang) })
+  content_origin_r  <- reactive({ run_query(query_content_by_origin) })
+  content_role_r    <- reactive({ run_query(query_content_by_role) })
+
+  creator_decade_r  <- reactive({ run_query(query_creator_by_decade) })
+  creator_lang_r    <- reactive({ run_query(query_creator_by_lang) })
+  creator_origin_r  <- reactive({ run_query(query_creator_by_origin) })
+  creator_role_r    <- reactive({ run_query(query_creator_by_role) })
+
+  fmt_content_dim <- function(df, group_col, header_label) {
+    df |>
+      filter(total_content > 0) |>
+      mutate(
+        pct_base  = pct_fmt(base_matched,  total_content),
+        pct_clean = pct_fmt(clean_matched, total_content),
+        pct_disc  = pct_fmt(disc_matched,  total_content)
+      ) |>
+      select({{ group_col }}, total_content,
+             pct_base, base_matched,
+             pct_clean, clean_matched,
+             pct_disc, disc_matched,
+             unmatched) |>
+      fmt_dt(first_col_name = header_label)
+  }
+
+  fmt_creator_dim <- function(df, group_col, header_label) {
+    df |>
+      filter(total_creator > 0) |>
+      mutate(
+        pct_base  = pct_fmt(base_matched,  total_creator),
+        pct_clean = pct_fmt(clean_matched, total_creator),
+        pct_disc  = pct_fmt(disc_matched,  total_creator)
+      ) |>
+      select({{ group_col }}, total_creator,
+             pct_base, base_matched,
+             pct_clean, clean_matched,
+             pct_disc, disc_matched,
+             unmatched) |>
+      fmt_dt(first_col_name = header_label)
+  }
+
+  output$tbl_content_decade <- renderDT({
+    df <- content_decade_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> mutate(decade_label = sprintf("%ds", decade))
+    fmt_content_dim(df, decade_label, "Decade")
+  })
+
+  output$tbl_content_lang <- renderDT({
+    df <- content_lang_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(lang = grouping)
+    fmt_content_dim(df, lang, "Language")
+  })
+
+  output$tbl_content_origin <- renderDT({
+    df <- content_origin_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(origin = grouping)
+    fmt_content_dim(df, origin, "Origin")
+  })
+
+  output$tbl_content_role <- renderDT({
+    df <- content_role_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(role = grouping)
+    fmt_content_dim(df, role, "Role")
+  })
+
+  output$tbl_creator_decade <- renderDT({
+    df <- creator_decade_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> mutate(decade_label = sprintf("%ds", decade))
+    fmt_creator_dim(df, decade_label, "Decade")
+  })
+
+  output$tbl_creator_lang <- renderDT({
+    df <- creator_lang_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(lang = grouping)
+    fmt_creator_dim(df, lang, "Language")
+  })
+
+  output$tbl_creator_origin <- renderDT({
+    df <- creator_origin_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(origin = grouping)
+    fmt_creator_dim(df, origin, "Origin")
+  })
+
+  output$tbl_creator_role <- renderDT({
+    df <- creator_role_r()
+    if (!nrow(df)) return(fmt_dt(data.frame()))
+    df <- df |> rename(role = grouping)
+    fmt_creator_dim(df, role, "Role")
+  })
+}
+
+# =============================================================================
+# RUN
+# =============================================================================
+shinyApp(ui, server)
