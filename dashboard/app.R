@@ -24,14 +24,29 @@ IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
 # the parquets are downloaded into the webR virtual filesystem at runtime.
 DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
 
-# Where the Shinylive build fetches the two parquets from gh-pages
-PARQUET_BASE_URL <- Sys.getenv(
-  "NITRATE_PARQUET_BASE_URL",
-  "https://jacobmgreer.github.io/in-sound/data"
-)
+# ── Sharded layout ────────────────────────────────────────────────────────────
+# Content and creators now live in the SAME files — identical columns and
+# bitmasks — discriminated by the `type` column:
+#     type = 1  → content
+#     type = 2  → creator
+# The export is split into N_PARQUET_FILES shards named big_sight_0.parquet,
+# big_sight_1.parquet, … Local dev reads them straight from DATA_DIR; Shinylive
+# fetches each shard and unions them into a single DuckDB table (nc_data).
+N_PARQUET_FILES <- 10
+PARQUET_FILES <- function() {
+  file.path(DATA_DIR, sprintf("big_sound_%d.parquet", seq_len(N_PARQUET_FILES) - 1))
+}
 
-CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sound_content.parquet")
-CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sound_creator.parquet")
+# Where Shinylive fetches the 10 shards.
+#
+# DEFAULT: same-origin
+# OVERRIDE: set NITRATE_PARQUET_BASE_URL
+# Local dev ignores all of this entirely and reads DATA_DIR from disk.
+# PARQUET_BASE_URL_ENV <- "NITRATE_PARQUET_BASE_URL"
+
+TYPE_CONTENT <- 1L
+TYPE_CREATOR <- 2L
+
 FILTER_DEBOUNCE_MS <- 400
 
 MACRO_DIR <- "macros"
@@ -44,11 +59,9 @@ DECADE_BITS       <- integer()
 ORIGIN_BITS       <- integer()
 GRAPH_BITS        <- integer()
 SOURCE_ID_TO_NAME <- integer()
-CONTENT_SCHEMA    <- NULL
-CREATOR_SCHEMA    <- NULL
+ENTITY_SCHEMA     <- NULL
 FILTER_CHOICES    <- list(
-  ok = FALSE, 
-  decades = numeric(),
+  ok = FALSE, decades = numeric(),
   sources = setNames(integer(0), character(0)),
   source_ids = integer(),
   origins = character()
@@ -61,7 +74,6 @@ NC_CON <- NULL
 
 sql_quote <- function(x) sprintf("'%s'", gsub("'", "''", as.character(x), fixed = TRUE))
 sql_int_in <- function(v) paste0("(", paste(as.integer(v), collapse = ", "), ")")
-sql_in     <- function(v) paste0("(", paste(sql_quote(v), collapse = ", "), ")")
 
 open_con <- function() {
   con <- dbConnect(duckdb(), dbdir = ":memory:", read_only = FALSE)
@@ -90,12 +102,12 @@ run_sql <- function(con, sql) {
 }
 
 check_files <- function() {
-  files <- c(CONTENT_PARQUET(), CREATOR_PARQUET())
+  files <- PARQUET_FILES()
   basename(files[!file.exists(files)])
 }
 
 # =============================================================================
-# SHINYLIVE DATA FETCH — pull the release parquets into the webR filesystem
+# SHINYLIVE DATA FETCH — pull the shard parquets into the webR filesystem
 # =============================================================================
 
 # Diagnostics from the last fetch attempt, surfaced in the UI on failure so a
@@ -168,12 +180,31 @@ fetch_binary <- function(url, dest) {
   TRUE
 }
 
-download_parquets <- function() {
+# Resolve the shard base URL. Explicit env var wins; otherwise derive a
+# same-origin "<page>/data" URL from the Shinylive page location so no CORS
+# proxy is needed when the parquets ship on the same GitHub Pages site.
+parquet_base_url <- function(session) {
+  env <- Sys.getenv(PARQUET_BASE_URL_ENV, "")
+  if (nzchar(env)) return(sub("/$", "", env))
+
+  cd   <- session$clientData
+  path <- cd$url_pathname %||% "/"
+  path <- sub("index\\.html$", "", path)
+  if (!grepl("/$", path)) path <- paste0(path, "/")
+
+  port <- cd$url_port %||% ""
+  host <- cd$url_hostname %||% ""
+  if (nzchar(port) && !port %in% c("80", "443")) host <- paste0(host, ":", port)
+
+  paste0(cd$url_protocol %||% "https:", "//", host, path, "data")
+}
+
+download_parquets <- function(base_url) {
   dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
   ok <- TRUE
-  for (f in c(CONTENT_PARQUET(), CREATOR_PARQUET())) {
+  for (f in PARQUET_FILES()) {
     if (file.exists(f)) next
-    src <- paste0(PARQUET_BASE_URL, "/", basename(f))
+    src <- paste0(base_url, "/", basename(f))
     log_fetch("fetching ", basename(f), "…")
     ok <- fetch_binary(src, f) && ok
   }
@@ -189,7 +220,7 @@ pick_col <- function(cols, candidates, label) {
 }
 
 parquet_schema <- function(con, path) {
-  dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet(%s)", sql_quote(file.path(path))))
+  dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet(%s)", sql_quote(path)))
 }
 
 resolve_export_schema <- function(info, entity_label) {
@@ -199,6 +230,7 @@ resolve_export_schema <- function(info, entity_label) {
 
   list(
     id        = pick_col(cols, "big", sprintf("%s ID column", entity_label)),
+    type      = pick_col(cols, "type", sprintf("%s type column", entity_label)),
     decades   = pick_col(cols, "decades", sprintf("%s decade bitmask", entity_label)),
     source    = source_col,
     source_is_int = grepl("int|serial", source_type, ignore.case = TRUE),
@@ -261,52 +293,45 @@ bit_is_set_join_sql <- function(bitmask_col, alias = NULL) {
 }
 
 # =============================================================================
-# STARTUP — filter dropdown choices (requires parquet files present)
+# STARTUP — filter dropdown choices (requires nc_data table built)
 # =============================================================================
 
-distinct_bitmap_values <- function(con, parquet_path, bitmask_col, dim_table) {
+distinct_bitmap_values <- function(con, bitmask_col, dim_table) {
   sql <- sprintf(
     r"(
       SELECT DISTINCT d.value AS value
-      FROM read_parquet('%s') p
+      FROM nc_data p
       JOIN %s d ON %s
       ORDER BY value
     )",
-    parquet_path, dim_table, bit_is_set_join_sql(bitmask_col, "p")
+    dim_table, bit_is_set_join_sql(bitmask_col, "p")
   )
   safe_query(con, sql)
 }
 
-load_filter_choices <- function() {
+load_filter_choices <- function(con) {
   empty_sources <- setNames(integer(0), character(0))
   if (length(check_files()) > 0) {
     return(list(
-      ok = FALSE, 
-      decades = numeric(), 
-      sources = empty_sources,
-      source_ids = integer(), 
-      origins = character()
+      ok = FALSE, decades = numeric(), sources = empty_sources,
+      source_ids = integer(), langs = character(), origins = character(), roles = character()
     ))
   }
 
-  con <- open_con()
-  on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
-  register_dimension_tables(con)
+  ddf <- distinct_bitmap_values(con, ENTITY_SCHEMA$decades, "dim_decade")
+  odf <- distinct_bitmap_values(con, ENTITY_SCHEMA$origins, "dim_origin")
 
-  ddf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$decades, "dim_decade")
-  odf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$origins, "dim_origin")
-
-  source_col <- CONTENT_SCHEMA$source
+  source_col <- ENTITY_SCHEMA$source
   sdf_sql <- sprintf(
     r"(
       SELECT DISTINCT p.%s AS source_id,
              COALESCE(d.value, 'Source ' || CAST(p.%s AS VARCHAR)) AS source
-      FROM read_parquet(%s) p
+      FROM nc_data p
       LEFT JOIN dim_source d ON p.%s = d.bit
       WHERE p.%s IS NOT NULL
       ORDER BY source
     )",
-    source_col, source_col, sql_quote(CONTENT_PARQUET()), source_col, source_col
+    source_col, source_col, source_col, source_col
   )
   sdf <- safe_query(con, sdf_sql)
 
@@ -336,8 +361,8 @@ build_decade_choices <- function() {
 
 # =============================================================================
 # ENGINE INITIALIZATION — called once data files are guaranteed present.
-# Populates the module-level state via <<- so all query builders below work
-# unchanged whether running locally or in Shinylive.
+# Loads all shards into ONE DuckDB table (nc_data); content vs. creator views
+# are separated at query time by the `type` column (1 = content, 2 = creator).
 # =============================================================================
 
 init_engine <- function() {
@@ -349,26 +374,26 @@ init_engine <- function() {
   GRAPH_BITS        <<- load_bits_from_macro(schema_con, "get_comp_mapping")
   SOURCE_ID_TO_NAME <<- load_bits_from_macro(schema_con, "get_source_mapping")
 
-  CONTENT_SCHEMA <<- resolve_export_schema(parquet_schema(schema_con, CONTENT_PARQUET()), "content")
-  CREATOR_SCHEMA <<- resolve_export_schema(parquet_schema(schema_con, CREATOR_PARQUET()), "creator")
+  ENTITY_SCHEMA <<- resolve_export_schema(parquet_schema(schema_con, PARQUET_FILES()[[1]]), "entity")
 
   dbDisconnect(schema_con, shutdown = TRUE)
-
-  FILTER_CHOICES <<- load_filter_choices()
 
   con <- open_con()
   register_dimension_tables(con)
 
-  message("[nitrate-dash] Loading parquets into DuckDB cache…")
-  dbExecute(con, sprintf("CREATE TABLE nc_content AS SELECT * FROM read_parquet('%s')", CONTENT_PARQUET()))
-  dbExecute(con, sprintf("CREATE TABLE nc_creator AS SELECT * FROM read_parquet('%s')", CREATOR_PARQUET()))
-  message("[nitrate-dash] Bitmap cache ready.")
+  message("[nitrate-dash] Loading ", N_PARQUET_FILES, " parquet shards into DuckDB cache…")
+  file_list <- paste(vapply(PARQUET_FILES(), sql_quote, character(1)), collapse = ", ")
+  dbExecute(con, sprintf("CREATE TABLE nc_data AS SELECT * FROM read_parquet([%s])", file_list))
+  message("[nitrate-dash] Unified table ready (content type=", TYPE_CONTENT,
+          ", creator type=", TYPE_CREATOR, ").")
+
+  FILTER_CHOICES <<- load_filter_choices(con)
 
   if (IS_SHINYLIVE) {
-    # The parquet bytes are now fully materialized as DuckDB tables, so drop
+    # The parquet bytes are now fully materialized as a DuckDB table, so drop
     # the raw-file copies from the webR virtual filesystem to free memory
     # (DuckDB-Wasm is capped around 4 GB total).
-    unlink(c(CONTENT_PARQUET(), CREATOR_PARQUET()))
+    unlink(PARQUET_FILES())
   }
 
   NC_CON <<- con
@@ -411,17 +436,13 @@ get_decade_values_sql <- function(inp) {
   paste(sprintf("(%d)", get_decade_values(inp)), collapse = ", ")
 }
 
-build_content_decade_clause <- function(inp, schema = CONTENT_SCHEMA) {
-  build_bitmask_clause(get_decade_values(inp), schema$decades, DECADE_BITS)
+build_decade_clause <- function(inp) {
+  build_bitmask_clause(get_decade_values(inp), ENTITY_SCHEMA$decades, DECADE_BITS)
 }
 
-build_creator_decade_clause <- function(inp, schema = CREATOR_SCHEMA) {
-  build_bitmask_clause(get_decade_values(inp), schema$decades, DECADE_BITS)
-}
+build_origin_clause <- function(inp) { build_bitmask_clause(inp$filter_origins, ENTITY_SCHEMA$origins, ORIGIN_BITS) }
 
-build_origin_clause <- function(inp, schema) { build_bitmask_clause(inp$filter_origins, schema$origins, ORIGIN_BITS) }
-
-build_source_clause <- function(inp, schema) {
+build_source_clause <- function(inp) {
   selected <- inp$filter_sources
   if (!length(selected)) return("AND 1=0")
 
@@ -430,115 +451,101 @@ build_source_clause <- function(inp, schema) {
   if (!length(selected)) return("AND 1=0")
   if (length(selected) >= length(FILTER_CHOICES$source_ids)) return("")
 
-  sprintf("AND %s IN %s", schema$source, sql_int_in(selected))
+  sprintf("AND %s IN %s", ENTITY_SCHEMA$source, sql_int_in(selected))
 }
 
 # =============================================================================
-# CTE BUILDERS
+# CTE BUILDERS — one table, separated by `type`
 # =============================================================================
 
-graph_columns <- function(schema) {
-  schema$graph_col
-}
-
-entity_cte <- function(table_name, id_col, schema, clauses) {
+entity_cte <- function(cte_name, type_value, clauses) {
   cols <- unique(c(
-    id_col, 
-    schema$source, 
-    schema$decades, 
-    schema$origins, 
-    graph_columns(schema)
+    ENTITY_SCHEMA$id, ENTITY_SCHEMA$type, ENTITY_SCHEMA$source,
+    ENTITY_SCHEMA$decades, ENTITY_SCHEMA$langs,
+    ENTITY_SCHEMA$origins, ENTITY_SCHEMA$roles, ENTITY_SCHEMA$graph_col
   ))
   sprintf(
-    "filtered_%s AS (SELECT %s FROM nc_%s WHERE 1=1 %s)",
-    table_name, paste(cols, collapse = ", "), table_name, paste(clauses, collapse = " ")
+    "filtered_%s AS (SELECT %s FROM nc_data WHERE %s = %d %s)",
+    cte_name, paste(cols, collapse = ", "), ENTITY_SCHEMA$type,
+    as.integer(type_value), paste(clauses, collapse = " ")
+  )
+}
+
+shared_filter_clauses <- function(inp) {
+  c(
+    build_source_clause(inp),
+    build_decade_clause(inp),
+    build_origin_clause(inp)
   )
 }
 
 build_content_cte <- function(inp) {
-  entity_cte(
-    "content", CONTENT_SCHEMA$id, CONTENT_SCHEMA,
-    c(
-      build_source_clause(inp, CONTENT_SCHEMA),
-      build_content_decade_clause(inp),
-      build_origin_clause(inp, CONTENT_SCHEMA)
-    )
-  )
+  entity_cte("content", TYPE_CONTENT, shared_filter_clauses(inp))
 }
 
 build_creator_cte <- function(inp) {
-  entity_cte(
-    "creator", CREATOR_SCHEMA$id, CREATOR_SCHEMA,
-    c(
-      build_source_clause(inp, CREATOR_SCHEMA),
-      build_creator_decade_clause(inp),
-      build_origin_clause(inp, CREATOR_SCHEMA)
-    )
-  )
+  entity_cte("creator", TYPE_CREATOR, shared_filter_clauses(inp))
 }
 
 # =============================================================================
 # QUERY FUNCTIONS
 # =============================================================================
 
-graph_match_expr <- function(schema, graph_name, alias = NULL) {
+graph_match_expr <- function(graph_name, alias = NULL) {
   prefix <- if (is.null(alias)) "" else paste0(alias, ".")
   sprintf(
     "((COALESCE(%s%s, 0)::BIGINT & (1::BIGINT << %d)) <> 0)",
-    prefix, schema$graph_col, GRAPH_BITS[[graph_name]]
+    prefix, ENTITY_SCHEMA$graph_col, GRAPH_BITS[[graph_name]]
   )
 }
 
 query_overview <- function(con, inp) {
-  content_base <- graph_match_expr(CONTENT_SCHEMA, "base")
-  content_clean <- graph_match_expr(CONTENT_SCHEMA, "clean")
-  content_disc <- graph_match_expr(CONTENT_SCHEMA, "discovery")
-  creator_base <- graph_match_expr(CREATOR_SCHEMA, "base")
-  creator_clean <- graph_match_expr(CREATOR_SCHEMA, "clean")
-  creator_disc <- graph_match_expr(CREATOR_SCHEMA, "discovery")
-
-  c_id <- CONTENT_SCHEMA$id
-  p_id <- CREATOR_SCHEMA$id
+  base_expr  <- graph_match_expr("base")
+  clean_expr <- graph_match_expr("clean")
+  disc_expr  <- graph_match_expr("discovery")
+  id_col     <- ENTITY_SCHEMA$id
+  type_col   <- ENTITY_SCHEMA$type
 
   sql <- sprintf(
     r"(
-      WITH %s,
-           %s,
-           cnt AS (
-             SELECT
-               COUNT(DISTINCT %s) AS total_content,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS base_content,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS clean_content,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS disc_content
-             FROM filtered_content
-           ),
-           ppl AS (
-             SELECT
-               COUNT(DISTINCT %s) AS total_creator,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS base_creator,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS clean_creator,
-               COUNT(DISTINCT CASE WHEN %s THEN %s END) AS disc_creator
-             FROM filtered_creator
-           )
-      SELECT * FROM cnt CROSS JOIN ppl
+      WITH filtered AS (
+        SELECT %s, %s, %s
+        FROM nc_data
+        WHERE 1=1 %s
+      )
+      SELECT
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 1) AS total_content,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 1 AND %s) AS base_content,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 1 AND %s) AS clean_content,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 1 AND %s) AS disc_content,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 2) AS total_creator,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 2 AND %s) AS base_creator,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 2 AND %s) AS clean_creator,
+        COUNT(DISTINCT %s) FILTER (WHERE %s = 2 AND %s) AS disc_creator
+      FROM filtered
     )",
-    build_content_cte(inp),
-    build_creator_cte(inp),
-    c_id, content_base, c_id, content_clean, c_id, content_disc, c_id,
-    p_id, creator_base, p_id, creator_clean, p_id, creator_disc, p_id
+    id_col, type_col, ENTITY_SCHEMA$graph_col,
+    paste(shared_filter_clauses(inp), collapse = " "),
+    id_col, type_col,
+    id_col, type_col, base_expr,
+    id_col, type_col, clean_expr,
+    id_col, type_col, disc_expr,
+    id_col, type_col,
+    id_col, type_col, base_expr,
+    id_col, type_col, clean_expr,
+    id_col, type_col, disc_expr
   )
 
   run_sql(con, sql)
 }
 
 query_by_bit_dimension <- function(con, inp, entity, dim_table, bitmask_col, order_by) {
-  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
-  id_col <- schema$id
+  id_col <- ENTITY_SCHEMA$id
   total_col <- paste0("total_", entity)
   table <- paste0("filtered_", entity)
-  base_expr <- graph_match_expr(schema, "base", "f")
-  clean_expr <- graph_match_expr(schema, "clean", "f")
-  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  base_expr <- graph_match_expr("base", "f")
+  clean_expr <- graph_match_expr("clean", "f")
+  disc_expr <- graph_match_expr("discovery", "f")
   cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
 
   sql <- sprintf(
@@ -570,17 +577,16 @@ query_by_bit_dimension <- function(con, inp, entity, dim_table, bitmask_col, ord
   run_sql(con, sql)
 }
 
-query_content_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_origin", CONTENT_SCHEMA$origins, "total_content DESC")
-query_creator_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_origin", CREATOR_SCHEMA$origins, "total_creator DESC")
+query_content_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_origin", ENTITY_SCHEMA$origins, "total_content DESC")
+query_creator_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_origin", ENTITY_SCHEMA$origins, "total_creator DESC")
 
 query_by_decade <- function(con, inp, entity) {
-  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
-  id_col <- schema$id
+  id_col <- ENTITY_SCHEMA$id
   total_col <- paste0("total_", entity)
   table <- paste0("filtered_", entity)
-  base_expr <- graph_match_expr(schema, "base", "f")
-  clean_expr <- graph_match_expr(schema, "clean", "f")
-  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  base_expr <- graph_match_expr("base", "f")
+  clean_expr <- graph_match_expr("clean", "f")
+  disc_expr <- graph_match_expr("discovery", "f")
   cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
   dec_values <- get_decade_values_sql(inp)
 
@@ -614,7 +620,7 @@ query_by_decade <- function(con, inp, entity) {
     dec_values,
     id_col,
     base_expr, clean_expr, disc_expr,
-    table, bit_is_set_join_sql(schema$decades, "f"),
+    table, bit_is_set_join_sql(ENTITY_SCHEMA$decades, "f"),
     total_col
   )
 
@@ -625,16 +631,15 @@ query_content_by_decade <- function(con, inp) query_by_decade(con, inp, "content
 query_creator_by_decade <- function(con, inp) query_by_decade(con, inp, "creator")
 
 query_by_source <- function(con, inp, entity) {
-  schema <- if (entity == "content") CONTENT_SCHEMA else CREATOR_SCHEMA
-  id_col <- schema$id
+  id_col <- ENTITY_SCHEMA$id
   total_col <- paste0("total_", entity)
   table <- paste0("filtered_", entity)
-  base_expr <- graph_match_expr(schema, "base", "f")
-  clean_expr <- graph_match_expr(schema, "clean", "f")
-  disc_expr <- graph_match_expr(schema, "discovery", "f")
+  base_expr <- graph_match_expr("base", "f")
+  clean_expr <- graph_match_expr("clean", "f")
+  disc_expr <- graph_match_expr("discovery", "f")
   cte <- if (entity == "content") build_content_cte(inp) else build_creator_cte(inp)
 
-  source_ref <- paste0("f.", schema$source)
+  source_ref <- paste0("f.", ENTITY_SCHEMA$source)
   source_select <- sprintf("COALESCE(s.value, 'Source ' || CAST(%s AS VARCHAR)) AS source", source_ref)
   source_join <- sprintf("LEFT JOIN dim_source s ON %s = s.bit", source_ref)
   group_by_expr <- sprintf("COALESCE(s.value, 'Source ' || CAST(%s AS VARCHAR))", source_ref)
@@ -847,15 +852,16 @@ server <- function(input, output, session) {
   # data_status: "pending" -> "ok" | "failed"
   data_status <- reactiveVal("pending")
 
-  # One-time startup: ensure parquet files exist (downloading them from the
-  # deployed site when running under Shinylive/webR), then build the engine.
+  # One-time startup: ensure the 10 shard files exist (downloading them from
+  # the deployed site when running under Shinylive/webR), then build the engine.
   observe({
     if (length(check_files()) > 0 && IS_SHINYLIVE) {
-      # Files are not in the webR virtual filesystem yet; pull them from the
-      # release via PARQUET_BASE_URL, then fall through to engine init below.
-      message("[nitrate-dash] parquet files not found locally; fetching from release")
+      # Files are not in the webR virtual filesystem yet; pull the missing
+      # shards from the same origin as the app (or NITRATE_PARQUET_BASE_URL),
+      # then fall through to engine init below.
+      message("[nitrate-dash] parquet shards not found locally; fetching")
       tryCatch(
-        download_parquets(),
+        download_parquets(parquet_base_url(session)),
         error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
       )
     }
@@ -883,8 +889,9 @@ server <- function(input, output, session) {
                   choices = build_decade_choices(), selected = ""),
       selectInput("filter_decade_to", "To Decade",
                   choices = build_decade_choices(), selected = ""),
-      selectInput("filter_origins", "Origin(s)",
-                  choices = FILTER_CHOICES$origins, selected = NULL, multiple = TRUE),
+      selectizeInput("filter_origins", "Origin(s)",
+                     choices = FILTER_CHOICES$origins, selected = NULL, multiple = TRUE,
+                     options = list(plugins = list("remove_button"), placeholder = "All")),
       hr(style = "margin:6px 0"),
       h6("Source"),
       checkboxGroupInput("filter_sources", label = NULL,
@@ -902,17 +909,17 @@ server <- function(input, output, session) {
     if (status == "ok") return(NULL)
 
     if (IS_SHINYLIVE && length(FETCH_LOG) > 0) {
-      targets <- paste0(PARQUET_BASE_URL, "/", basename(c(CONTENT_PARQUET(), CREATOR_PARQUET())))
+      base <- parquet_base_url(session)
+      targets <- paste0(base, "/", basename(PARQUET_FILES()))
       return(div(class = "alert alert-danger",
         tags$strong("Parquet download failed in the browser."), tags$br(),
         "Attempted: ", tags$ul(lapply(targets, function(u) tags$li(tags$code(u)))),
         tags$strong("What the server said:"),
         tags$ul(lapply(utils::tail(FETCH_LOG, 6), tags$li)),
         tags$hr(),
-        "Most likely fixes: (1) confirm the release assets exist at that exact URL; ",
-        "(2) if using Corsfix, register this origin — ", tags$code("https://", session$clientData$url_hostname),
-        " — in the Corsfix dashboard, or set an API key via the ",
-        tags$code("NITRATE_PARQUET_HEADERS"), " env var. See GITHUB_PAGES.md."
+        "Most likely fixes: (1) confirm all ", N_PARQUET_FILES,
+        " shards (big_sight_0.parquet … big_sight_", N_PARQUET_FILES - 1,
+        ".parquet) exist under ", tags$code(base)
       ))
     }
 
@@ -920,7 +927,7 @@ server <- function(input, output, session) {
     div(class = "alert alert-warning",
       tags$strong("Missing parquet files: "),
       tags$code(paste(missing, collapse = ", ")), tags$br(),
-      sprintf("Update DATA_DIR at the top of app.R (current: '%s')", DATA_DIR))
+      sprintf("Update DATA_DIR / N_PARQUET_FILES at the top of app.R (current DATA_DIR: '%s')", DATA_DIR))
   })
 
   resolve_input <- function() {
@@ -940,8 +947,10 @@ server <- function(input, output, session) {
     qfn(NC_CON, inp)
   }
 
+  overview_data <- reactive({ run_query(query_overview) })
+
   output$content_overview_metrics <- renderUI({
-    df <- run_query(query_overview)
+    df <- overview_data()
     if (!nrow(df) || all(is.na(unlist(df))))
       return(p(class = "text-muted", "No data for the selected filters."))
     r <- df[1, ]
@@ -971,7 +980,7 @@ server <- function(input, output, session) {
   })
 
   output$creator_overview_metrics <- renderUI({
-    df <- run_query(query_overview)
+    df <- overview_data()
     if (!nrow(df) || all(is.na(unlist(df))))
       return(p(class = "text-muted", "No data for the selected filters."))
     r <- df[1, ]
