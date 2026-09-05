@@ -24,34 +24,14 @@ IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
 # the parquets are downloaded into the webR virtual filesystem at runtime.
 DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
 
-# Where the Shinylive build fetches the two parquets.
-#
-# IMPORTANT: github.com/<owner>/<repo>/releases/latest/download/<file> is NOT
-# directly fetchable from a browser page (302 redirect + no CORS headers on
-# the asset CDN), so requests go through a CORS proxy. Current setup: Corsfix.
-#
-# Corsfix production checklist (requests will FAIL with a tiny error body
-# until these are done):
-#   1. Add your Pages origin (e.g. "jacobmgreer.github.io") in the Corsfix
-#      dashboard domain whitelist — localhost works free without setup, but
-#      deployed origins must be registered (or use an API key, see below).
-#   2. Public/open-source projects can apply for Corsfix's OSS sponsorship
-#      instead of a paid plan.
-#   3. Mind the proxy's 20 s response timeout — very large/slow downloads
-#      return 504.
-#
-# If you use an API key instead of domain whitelisting, pass it via headers:
-#   NITRATE_PARQUET_HEADERS="x-corsfix-key: cfx_your_key_here"
-# (a client-side key is public by nature — prefer domain whitelisting.)
-#
-# Local dev ignores all of this entirely and reads DATA_DIR from disk.
+# Where the Shinylive build fetches the two parquets from gh-pages
 PARQUET_BASE_URL <- Sys.getenv(
   "NITRATE_PARQUET_BASE_URL",
-  "https://proxy.corsfix.com/?https://github.com/jacobmgreer/in-sight/releases/latest/download"
+  "https://jacobmgreer.github.io/in-sound/data"
 )
 
-CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sight_content.parquet")
-CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sight_creator.parquet")
+CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sound_content.parquet")
+CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sound_creator.parquet")
 FILTER_DEBOUNCE_MS <- 400
 
 MACRO_DIR <- "macros"
@@ -61,18 +41,17 @@ MACRO_DIR <- "macros"
 # =============================================================================
 
 DECADE_BITS       <- integer()
-ROLE_BITS         <- integer()
-LANG_BITS         <- integer()
 ORIGIN_BITS       <- integer()
 GRAPH_BITS        <- integer()
 SOURCE_ID_TO_NAME <- integer()
 CONTENT_SCHEMA    <- NULL
 CREATOR_SCHEMA    <- NULL
 FILTER_CHOICES    <- list(
-  ok = FALSE, decades = numeric(),
+  ok = FALSE, 
+  decades = numeric(),
   sources = setNames(integer(0), character(0)),
   source_ids = integer(),
-  langs = character(), origins = character(), roles = character()
+  origins = character()
 )
 NC_CON <- NULL
 
@@ -223,9 +202,7 @@ resolve_export_schema <- function(info, entity_label) {
     decades   = pick_col(cols, "decades", sprintf("%s decade bitmask", entity_label)),
     source    = source_col,
     source_is_int = grepl("int|serial", source_type, ignore.case = TRUE),
-    langs     = pick_col(cols, "langs", sprintf("%s language bitmask", entity_label)),
     origins   = pick_col(cols, "origins", sprintf("%s origin bitmask", entity_label)),
-    roles     = pick_col(cols, "roles", sprintf("%s role bitmask", entity_label)),
     graph_col = pick_col(cols, "comp", sprintf("%s graph bitmask", entity_label))
   )
 }
@@ -266,8 +243,6 @@ create_dimension_table <- function(con, table_name, bits, numeric_values = FALSE
 
 register_dimension_tables <- function(con) {
   create_dimension_table(con, "dim_decade", DECADE_BITS, numeric_values = TRUE)
-  create_dimension_table(con, "dim_role", ROLE_BITS)
-  create_dimension_table(con, "dim_lang", LANG_BITS)
   create_dimension_table(con, "dim_origin", ORIGIN_BITS)
 
   source_rows <- vapply(seq_along(SOURCE_ID_TO_NAME), function(i) {
@@ -306,8 +281,11 @@ load_filter_choices <- function() {
   empty_sources <- setNames(integer(0), character(0))
   if (length(check_files()) > 0) {
     return(list(
-      ok = FALSE, decades = numeric(), sources = empty_sources,
-      source_ids = integer(), langs = character(), origins = character(), roles = character()
+      ok = FALSE, 
+      decades = numeric(), 
+      sources = empty_sources,
+      source_ids = integer(), 
+      origins = character()
     ))
   }
 
@@ -316,9 +294,7 @@ load_filter_choices <- function() {
   register_dimension_tables(con)
 
   ddf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$decades, "dim_decade")
-  ldf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$langs, "dim_lang")
   odf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$origins, "dim_origin")
-  rdf <- distinct_bitmap_values(con, CONTENT_PARQUET(), CONTENT_SCHEMA$roles, "dim_role")
 
   source_col <- CONTENT_SCHEMA$source
   sdf_sql <- sprintf(
@@ -343,9 +319,7 @@ load_filter_choices <- function() {
     decades    = if (nrow(ddf) > 0) sort(as.numeric(ddf$value)) else as.numeric(names(DECADE_BITS)),
     sources    = sources,
     source_ids = source_ids,
-    langs      = if (nrow(ldf) > 0) as.character(ldf$value) else names(LANG_BITS),
-    origins    = if (nrow(odf) > 0) as.character(odf$value) else names(ORIGIN_BITS),
-    roles      = if (nrow(rdf) > 0) as.character(rdf$value) else names(ROLE_BITS)
+    origins    = if (nrow(odf) > 0) as.character(odf$value) else names(ORIGIN_BITS)
   )
 }
 
@@ -371,8 +345,6 @@ init_engine <- function() {
   register_all_macros(schema_con)
 
   DECADE_BITS       <<- load_bits_from_macro(schema_con, "get_decade_mapping")
-  ROLE_BITS         <<- load_bits_from_macro(schema_con, "get_role_mapping")
-  LANG_BITS         <<- load_bits_from_macro(schema_con, "get_language_mapping")
   ORIGIN_BITS       <<- load_bits_from_macro(schema_con, "get_origin_mapping")
   GRAPH_BITS        <<- load_bits_from_macro(schema_con, "get_comp_mapping")
   SOURCE_ID_TO_NAME <<- load_bits_from_macro(schema_con, "get_source_mapping")
@@ -447,9 +419,7 @@ build_creator_decade_clause <- function(inp, schema = CREATOR_SCHEMA) {
   build_bitmask_clause(get_decade_values(inp), schema$decades, DECADE_BITS)
 }
 
-build_lang_clause <- function(inp, schema)   { build_bitmask_clause(inp$filter_langs, schema$langs, LANG_BITS) }
 build_origin_clause <- function(inp, schema) { build_bitmask_clause(inp$filter_origins, schema$origins, ORIGIN_BITS) }
-build_role_clause <- function(inp, schema)   { build_bitmask_clause(inp$filter_roles, schema$roles, ROLE_BITS) }
 
 build_source_clause <- function(inp, schema) {
   selected <- inp$filter_sources
@@ -473,8 +443,11 @@ graph_columns <- function(schema) {
 
 entity_cte <- function(table_name, id_col, schema, clauses) {
   cols <- unique(c(
-    id_col, schema$source, schema$decades, schema$langs,
-    schema$origins, schema$roles, graph_columns(schema)
+    id_col, 
+    schema$source, 
+    schema$decades, 
+    schema$origins, 
+    graph_columns(schema)
   ))
   sprintf(
     "filtered_%s AS (SELECT %s FROM nc_%s WHERE 1=1 %s)",
@@ -488,9 +461,7 @@ build_content_cte <- function(inp) {
     c(
       build_source_clause(inp, CONTENT_SCHEMA),
       build_content_decade_clause(inp),
-      build_lang_clause(inp, CONTENT_SCHEMA),
-      build_origin_clause(inp, CONTENT_SCHEMA),
-      build_role_clause(inp, CONTENT_SCHEMA)
+      build_origin_clause(inp, CONTENT_SCHEMA)
     )
   )
 }
@@ -501,9 +472,7 @@ build_creator_cte <- function(inp) {
     c(
       build_source_clause(inp, CREATOR_SCHEMA),
       build_creator_decade_clause(inp),
-      build_lang_clause(inp, CREATOR_SCHEMA),
-      build_origin_clause(inp, CREATOR_SCHEMA),
-      build_role_clause(inp, CREATOR_SCHEMA)
+      build_origin_clause(inp, CREATOR_SCHEMA)
     )
   )
 }
@@ -521,12 +490,12 @@ graph_match_expr <- function(schema, graph_name, alias = NULL) {
 }
 
 query_overview <- function(con, inp) {
-  content_base    <- graph_match_expr(CONTENT_SCHEMA, "base")
-  content_clean   <- graph_match_expr(CONTENT_SCHEMA, "clean")
-  content_disc    <- graph_match_expr(CONTENT_SCHEMA, "discovery")
-  creator_base    <- graph_match_expr(CREATOR_SCHEMA, "base")
-  creator_clean   <- graph_match_expr(CREATOR_SCHEMA, "clean")
-  creator_disc    <- graph_match_expr(CREATOR_SCHEMA, "discovery")
+  content_base <- graph_match_expr(CONTENT_SCHEMA, "base")
+  content_clean <- graph_match_expr(CONTENT_SCHEMA, "clean")
+  content_disc <- graph_match_expr(CONTENT_SCHEMA, "discovery")
+  creator_base <- graph_match_expr(CREATOR_SCHEMA, "base")
+  creator_clean <- graph_match_expr(CREATOR_SCHEMA, "clean")
+  creator_disc <- graph_match_expr(CREATOR_SCHEMA, "discovery")
 
   c_id <- CONTENT_SCHEMA$id
   p_id <- CREATOR_SCHEMA$id
@@ -601,11 +570,7 @@ query_by_bit_dimension <- function(con, inp, entity, dim_table, bitmask_col, ord
   run_sql(con, sql)
 }
 
-query_content_by_role   <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_role",   CONTENT_SCHEMA$roles,   "total_content DESC")
-query_content_by_lang   <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_lang",   CONTENT_SCHEMA$langs,   "total_content DESC")
 query_content_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "content", "dim_origin", CONTENT_SCHEMA$origins, "total_content DESC")
-query_creator_by_role   <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_role",   CREATOR_SCHEMA$roles,   "total_creator DESC")
-query_creator_by_lang   <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_lang",   CREATOR_SCHEMA$langs,   "total_creator DESC")
 query_creator_by_origin <- function(con, inp) query_by_bit_dimension(con, inp, "creator", "dim_origin", CREATOR_SCHEMA$origins, "total_creator DESC")
 
 query_by_decade <- function(con, inp, entity) {
@@ -848,18 +813,6 @@ ui <- page_navbar(
     DTOutput("tbl_by_creator_source")
   ),
 
-  nav_panel("By Role",
-    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
-    hr(style = "margin:16px;border:0;"),
-    h5("Content Records by Credited Role(s)"),
-    DTOutput("tbl_content_role"),
-
-    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
-    hr(style = "margin:16px;border:0;"),
-    h5("Creator Records by Credited Role(s)"),
-    DTOutput("tbl_creator_role")
-  ),
-
   nav_panel("By Decade",
     h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
     hr(style = "margin:16px;border:0;"),
@@ -870,18 +823,6 @@ ui <- page_navbar(
     hr(style = "margin:16px;border:0;"),
     h5("Creator Records by Associated Content Decade(s)"),
     DTOutput("tbl_creator_decade")
-  ),
-
-  nav_panel("By Language",
-    h6(class = "text-muted", style = "font-size:2em; margin:4px 0 0 0;", "Content"),
-    hr(style = "margin:16px;border:0;"),
-    h5("Content Records by Language(s)"),
-    DTOutput("tbl_content_lang"),
-
-    h6(class = "text-muted", style = "font-size:2em; margin:20px 0 0 0;", "Creator"),
-    hr(style = "margin:16px;border:0;"),
-    h5("Creator Records by Associated Content Language(s)"),
-    DTOutput("tbl_creator_lang")
   ),
 
   nav_panel("By Origin",
@@ -942,12 +883,8 @@ server <- function(input, output, session) {
                   choices = build_decade_choices(), selected = ""),
       selectInput("filter_decade_to", "To Decade",
                   choices = build_decade_choices(), selected = ""),
-      selectInput("filter_langs", "Language(s)",
-                  choices = FILTER_CHOICES$langs, selected = NULL, multiple = TRUE),
       selectInput("filter_origins", "Origin(s)",
                   choices = FILTER_CHOICES$origins, selected = NULL, multiple = TRUE),
-      selectInput("filter_roles", "Role(s)",
-                  choices = FILTER_CHOICES$roles, selected = NULL, multiple = TRUE),
       hr(style = "margin:6px 0"),
       h6("Source"),
       checkboxGroupInput("filter_sources", label = NULL,
@@ -990,9 +927,7 @@ server <- function(input, output, session) {
     list(
       filter_decade_from = input$filter_decade_from %||% "",
       filter_decade_to   = input$filter_decade_to %||% "",
-      filter_langs       = input$filter_langs %||% NULL,
       filter_origins     = input$filter_origins %||% NULL,
-      filter_roles       = input$filter_roles %||% NULL,
       filter_sources     = input$filter_sources %||% FILTER_CHOICES$source_ids
     )
   }
@@ -1118,14 +1053,10 @@ server <- function(input, output, session) {
   })
 
   content_decade_r  <- reactive({ run_query(query_content_by_decade) })
-  content_lang_r    <- reactive({ run_query(query_content_by_lang) })
   content_origin_r  <- reactive({ run_query(query_content_by_origin) })
-  content_role_r    <- reactive({ run_query(query_content_by_role) })
 
   creator_decade_r  <- reactive({ run_query(query_creator_by_decade) })
-  creator_lang_r    <- reactive({ run_query(query_creator_by_lang) })
   creator_origin_r  <- reactive({ run_query(query_creator_by_origin) })
-  creator_role_r    <- reactive({ run_query(query_creator_by_role) })
 
   fmt_content_dim <- function(df, group_col, header_label) {
     df |>
@@ -1166,25 +1097,11 @@ server <- function(input, output, session) {
     fmt_content_dim(df, decade_label, "Decade")
   })
 
-  output$tbl_content_lang <- renderDT({
-    df <- content_lang_r()
-    if (!nrow(df)) return(fmt_dt(data.frame()))
-    df <- df |> rename(lang = grouping)
-    fmt_content_dim(df, lang, "Language")
-  })
-
   output$tbl_content_origin <- renderDT({
     df <- content_origin_r()
     if (!nrow(df)) return(fmt_dt(data.frame()))
     df <- df |> rename(origin = grouping)
     fmt_content_dim(df, origin, "Origin")
-  })
-
-  output$tbl_content_role <- renderDT({
-    df <- content_role_r()
-    if (!nrow(df)) return(fmt_dt(data.frame()))
-    df <- df |> rename(role = grouping)
-    fmt_content_dim(df, role, "Role")
   })
 
   output$tbl_creator_decade <- renderDT({
@@ -1194,13 +1111,6 @@ server <- function(input, output, session) {
     fmt_creator_dim(df, decade_label, "Decade")
   })
 
-  output$tbl_creator_lang <- renderDT({
-    df <- creator_lang_r()
-    if (!nrow(df)) return(fmt_dt(data.frame()))
-    df <- df |> rename(lang = grouping)
-    fmt_creator_dim(df, lang, "Language")
-  })
-
   output$tbl_creator_origin <- renderDT({
     df <- creator_origin_r()
     if (!nrow(df)) return(fmt_dt(data.frame()))
@@ -1208,12 +1118,6 @@ server <- function(input, output, session) {
     fmt_creator_dim(df, origin, "Origin")
   })
 
-  output$tbl_creator_role <- renderDT({
-    df <- creator_role_r()
-    if (!nrow(df)) return(fmt_dt(data.frame()))
-    df <- df |> rename(role = grouping)
-    fmt_creator_dim(df, role, "Role")
-  })
 }
 
 # =============================================================================
