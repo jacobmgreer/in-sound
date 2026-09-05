@@ -1,0 +1,68 @@
+name: Build and Deploy Shinylive App
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+
+      - name: Set up R Dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache: true
+          packages: |
+            shinylive
+            dplyr
+            DT
+            scales
+
+      - name: Export Shinylive Static Site
+        run: |
+          Rscript -e 'shinylive::export("dashboard", "site", no_edit = TRUE)'
+
+      - name: Inject Parquet Data & Strip Editor Assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Force-remove any editor files or edit subdirectories created by Shinylive vendor packages
+          rm -rf site/edit site/shinylive/edit
+
+          # Inject external hive dataset into the site root so the app can fetch
+          # individual parquet files over HTTP at runtime (NOT baked into app.json).
+          # Layout served: <base>/data/manifest.txt and <base>/data/<rel-path>.parquet
+          if [ -d "data" ]; then
+            mkdir -p site/data
+            cp -r data/. site/data/
+            # Manifest entries are paths relative to data/, e.g.:
+            #   shiny_content/source=1/part-000.parquet
+            (cd site && find data -type f -name '*.parquet' -print | sed 's|^data/||' > data/manifest.txt)
+
+            echo "Parquet files injected: $(wc -l < site/data/manifest.txt)"
+            head -n 5 site/data/manifest.txt
+          else
+            echo "::warning::No data/ directory found in repo root; app will have nothing to fetch."
+          fi
+
+          touch site/.nojekyll
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          force_orphan: true

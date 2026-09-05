@@ -14,13 +14,44 @@ options(bslib.precompiled = TRUE)
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
-# Mutable data location. Local dev: "data" or "../data" if run from dashboard/.
-# In Shinylive this stays "data" and the parquet files are downloaded into the
-# webR virtual filesystem at runtime from the deployed site.
-DATA_DIR <- "../data"
+# Detect the Shinylive/webR runtime. IN_SHINYLIVE is set by the shinylive
+# runtime; Emscripten is webR's sysname. A local R session hits neither.
+IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
+  identical(Sys.info()[["sysname"]], "Emscripten")
 
-CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sound_content.parquet")
-CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sound_creator.parquet")
+# Mutable data location. Local dev: "data" (repo root) or "../data" (dashboard/).
+# In Shinylive the app folder is the working directory, so keep it relative;
+# the parquets are downloaded into the webR virtual filesystem at runtime.
+DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
+
+# Where the Shinylive build fetches the two parquets.
+#
+# IMPORTANT: github.com/<owner>/<repo>/releases/latest/download/<file> is NOT
+# directly fetchable from a browser page (302 redirect + no CORS headers on
+# the asset CDN), so requests go through a CORS proxy. Current setup: Corsfix.
+#
+# Corsfix production checklist (requests will FAIL with a tiny error body
+# until these are done):
+#   1. Add your Pages origin (e.g. "jacobmgreer.github.io") in the Corsfix
+#      dashboard domain whitelist — localhost works free without setup, but
+#      deployed origins must be registered (or use an API key, see below).
+#   2. Public/open-source projects can apply for Corsfix's OSS sponsorship
+#      instead of a paid plan.
+#   3. Mind the proxy's 20 s response timeout — very large/slow downloads
+#      return 504.
+#
+# If you use an API key instead of domain whitelisting, pass it via headers:
+#   NITRATE_PARQUET_HEADERS="x-corsfix-key: cfx_your_key_here"
+# (a client-side key is public by nature — prefer domain whitelisting.)
+#
+# Local dev ignores all of this entirely and reads DATA_DIR from disk.
+PARQUET_BASE_URL <- Sys.getenv(
+  "NITRATE_PARQUET_BASE_URL",
+  "https://proxy.corsfix.com/?https://github.com/jacobmgreer/in-sight/releases/latest/download"
+)
+
+CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sight_content.parquet")
+CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sight_creator.parquet")
 FILTER_DEBOUNCE_MS <- 400
 
 MACRO_DIR <- "macros"
@@ -55,7 +86,9 @@ sql_in     <- function(v) paste0("(", paste(sql_quote(v), collapse = ", "), ")")
 
 open_con <- function() {
   con <- dbConnect(duckdb(), dbdir = ":memory:", read_only = FALSE)
-  dbExecute(con, "PRAGMA threads=6;")
+  # DuckDB-Wasm is single-threaded by default (multithreading needs COOP/CEOP
+  # headers, which GitHub Pages does not send), so only set this natively.
+  if (!IS_SHINYLIVE) dbExecute(con, "PRAGMA threads=6;")
   dbExecute(con, "SET preserve_insertion_order = false;")
   con
 }
@@ -80,6 +113,92 @@ run_sql <- function(con, sql) {
 check_files <- function() {
   files <- c(CONTENT_PARQUET(), CREATOR_PARQUET())
   basename(files[!file.exists(files)])
+}
+
+# =============================================================================
+# SHINYLIVE DATA FETCH — pull the release parquets into the webR filesystem
+# =============================================================================
+
+# Diagnostics from the last fetch attempt, surfaced in the UI on failure so a
+# broken download shows its real cause instead of masquerading as
+# "missing files / update DATA_DIR".
+FETCH_LOG <- character()
+log_fetch <- function(...) {
+  msg <- paste0(...)
+  FETCH_LOG[[length(FETCH_LOG) + 1]] <<- msg
+  message("[nitrate-dash] ", msg)
+}
+
+fetch_headers <- function() {
+  # Optional "Name: value" lines (one per line) for proxies needing an API key,
+  # e.g. NITRATE_PARQUET_HEADERS="x-corsfix-key: cfx_12345678"
+  h <- Sys.getenv("NITRATE_PARQUET_HEADERS", "")
+  if (!nzchar(h)) return(NULL)
+  lines <- trimws(strsplit(h, "\n")[[1]])
+  lines <- lines[nzchar(lines)]
+  if (!length(lines)) return(NULL)
+  kv <- strsplit(lines, ":", fixed = TRUE)
+  stats::setNames(
+    vapply(kv, function(x) trimws(paste(x[-1], collapse = ":")), character(1)),
+    vapply(kv, function(x) trimws(x[[1]]), character(1))
+  )
+}
+
+is_parquet_file <- function(path) {
+  if (!file.exists(path) || file.size(path) < 8) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con))
+  identical(readBin(con, "raw", 4), charToRaw("PAR1"))
+}
+
+sniff_text <- function(path, n = 200) {
+  con <- file(path, open = "rb")
+  on.exit(close(con))
+  gsub("[^[:print:]\t]", "?", rawToChar(readBin(con, "raw", n)))
+}
+
+fetch_one <- function(url, dest) {
+  args <- list(url = url, destfile = dest, mode = "wb", quiet = TRUE)
+  hdrs <- fetch_headers()
+  if (!is.null(hdrs)) args$headers <- hdrs
+  tryCatch({
+    do.call(utils::download.file, args)
+    TRUE
+  }, error = function(e) {
+    log_fetch("fetch errored — ", url, " — ", conditionMessage(e))
+    FALSE
+  })
+}
+
+fetch_binary <- function(url, dest) {
+  if (!fetch_one(url, dest)) return(FALSE)
+
+  if (!file.exists(dest) || file.size(dest) == 0) {
+    log_fetch("fetch returned no data — ", url)
+    unlink(dest)
+    return(FALSE)
+  }
+  if (!is_parquet_file(dest)) {
+    # A CORS proxy / 404 / "origin not allowed" response is usually a tiny
+    # JSON or HTML body — log its beginning so the UI can show the cause.
+    log_fetch("response was not parquet (", file.size(dest), " B) — ", url,
+              " — first bytes: ", sniff_text(dest))
+    unlink(dest)
+    return(FALSE)
+  }
+  TRUE
+}
+
+download_parquets <- function() {
+  dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+  ok <- TRUE
+  for (f in c(CONTENT_PARQUET(), CREATOR_PARQUET())) {
+    if (file.exists(f)) next
+    src <- paste0(PARQUET_BASE_URL, "/", basename(f))
+    log_fetch("fetching ", basename(f), "…")
+    ok <- fetch_binary(src, f) && ok
+  }
+  ok
 }
 
 pick_col <- function(cols, candidates, label) {
@@ -272,6 +391,13 @@ init_engine <- function() {
   dbExecute(con, sprintf("CREATE TABLE nc_content AS SELECT * FROM read_parquet('%s')", CONTENT_PARQUET()))
   dbExecute(con, sprintf("CREATE TABLE nc_creator AS SELECT * FROM read_parquet('%s')", CREATOR_PARQUET()))
   message("[nitrate-dash] Bitmap cache ready.")
+
+  if (IS_SHINYLIVE) {
+    # The parquet bytes are now fully materialized as DuckDB tables, so drop
+    # the raw-file copies from the webR virtual filesystem to free memory
+    # (DuckDB-Wasm is capped around 4 GB total).
+    unlink(c(CONTENT_PARQUET(), CREATOR_PARQUET()))
+  }
 
   NC_CON <<- con
   invisible(TRUE)
@@ -783,22 +909,14 @@ server <- function(input, output, session) {
   # One-time startup: ensure parquet files exist (downloading them from the
   # deployed site when running under Shinylive/webR), then build the engine.
   observe({
-    if (length(check_files()) > 0) {
-      # Files are not on the local/virtual filesystem. Build an absolute base
-      # URL for this deployment from the browser's own location — works for
-      # user/org pages (pathname "/") and project pages (pathname "/repo/").
-      base_url <- paste0(
-        session$clientData$url_protocol, "//",
-        session$clientData$url_host,
-        session$clientData$url_pathname
+    if (length(check_files()) > 0 && IS_SHINYLIVE) {
+      # Files are not in the webR virtual filesystem yet; pull them from the
+      # release via PARQUET_BASE_URL, then fall through to engine init below.
+      message("[nitrate-dash] parquet files not found locally; fetching from release")
+      tryCatch(
+        download_parquets(),
+        error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
       )
-      if (!endsWith(base_url, "/")) base_url <- paste0(base_url, "/")
-
-      # message("[nitrate-dash] parquet files not found locally; fetching from ", base_url)
-      # tryCatch(
-      #   download_parquets_from_manifest(base_url),
-      #   error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
-      # )
     }
 
     if (length(check_files()) == 0) {
@@ -845,6 +963,21 @@ server <- function(input, output, session) {
         tags$strong("Loading parquet data… "), "this only happens once per visit."))
     }
     if (status == "ok") return(NULL)
+
+    if (IS_SHINYLIVE && length(FETCH_LOG) > 0) {
+      targets <- paste0(PARQUET_BASE_URL, "/", basename(c(CONTENT_PARQUET(), CREATOR_PARQUET())))
+      return(div(class = "alert alert-danger",
+        tags$strong("Parquet download failed in the browser."), tags$br(),
+        "Attempted: ", tags$ul(lapply(targets, function(u) tags$li(tags$code(u)))),
+        tags$strong("What the server said:"),
+        tags$ul(lapply(utils::tail(FETCH_LOG, 6), tags$li)),
+        tags$hr(),
+        "Most likely fixes: (1) confirm the release assets exist at that exact URL; ",
+        "(2) if using Corsfix, register this origin — ", tags$code("https://", session$clientData$url_hostname),
+        " — in the Corsfix dashboard, or set an API key via the ",
+        tags$code("NITRATE_PARQUET_HEADERS"), " env var. See GITHUB_PAGES.md."
+      ))
+    }
 
     missing <- check_files()
     div(class = "alert alert-warning",
