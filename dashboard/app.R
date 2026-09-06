@@ -23,7 +23,7 @@ IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
 # Mutable data location. Local dev: "data" (repo root) or "../data" (dashboard/).
 # In Shinylive the app folder is the working directory, so keep it relative;
 # the parquets are downloaded into the webR virtual filesystem at runtime.
-DATA_DIR <- if (IS_SHINYLIVE) "" else "../data"
+DATA_DIR <- if (IS_SHINYLIVE) "main" else "../data"
 
 # ── Sharded layout ────────────────────────────────────────────────────────────
 # Content and creators now live in the SAME files — identical columns and
@@ -45,7 +45,7 @@ PARQUET_FILES <- function() {
 # Local dev ignores all of this entirely and reads DATA_DIR from disk.
 # PARQUET_BASE_URL_ENV <- "NITRATE_PARQUET_BASE_URL"
 # Point to your Hugging Face repository raw URL path
-NITRATE_PARQUET_BASE_URL = "https://huggingface.co/jacobmgreer/in-sound")
+NITRATE_PARQUET_BASE_URL = "https://huggingface.co/datasets/jacobmgreer/in-sound/resolve")
 
 
 TYPE_CONTENT <- 1L
