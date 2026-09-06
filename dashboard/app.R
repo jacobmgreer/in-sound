@@ -190,7 +190,13 @@ fetch_binary <- function(url, dest) {
 parquet_base_url <- function(session) {
   env <- Sys.getenv(PARQUET_BASE_URL_ENV, "")
   if (nzchar(env)) return(sub("/$", "", env))
-
+  
+  if (IS_SHINYLIVE) {
+    # Fallback directly to Hugging Face if no custom override is provided
+    return("https://huggingface.co/datasets/jacobmgreer/in-sound/resolve/main")
+  }
+  
+  # Same-origin fallback for local web servers
   cd   <- session$clientData
   path <- cd$url_pathname %||% "/"
   path <- sub("index\\.html$", "", path)
@@ -202,6 +208,7 @@ parquet_base_url <- function(session) {
 
   paste0(cd$url_protocol %||% "https:", "//", host, path, "data")
 }
+
 
 download_parquets <- function(base_url) {
   dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
