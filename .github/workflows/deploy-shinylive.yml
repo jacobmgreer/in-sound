@@ -1,68 +1,52 @@
-name: Build and Deploy Shinylive App
+name: Deploy Shiny Python to GH Pages
 
 on:
   push:
-    branches:
-      - main
+    branches: [main, master]
+  workflow_dispatch:
 
+# Set permissions for GitHub Pages deployment
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          r-version: 'release'
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Set up R Dependencies
-        uses: r-lib/actions/setup-r-dependencies@v2
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install shiny shinylive
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Export Shiny App via Shinylive
+        run: |
+          shinylive export . site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          cache: true
-          packages: |
-            shinylive
-            dplyr
-            DT
-            scales
-
-      - name: Export Shinylive Static Site
-        run: |
-          Rscript -e 'shinylive::export("dashboard", "site", no_edit = TRUE)'
-
-      - name: Inject Parquet Data & Strip Editor Assets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Force-remove any editor files or edit subdirectories created by Shinylive vendor packages
-          rm -rf site/edit site/shinylive/edit
-
-          # Inject external hive dataset into the site root so the app can fetch
-          # individual parquet files over HTTP at runtime (NOT baked into app.json).
-          # Layout served: <base>/data/manifest.txt and <base>/data/<rel-path>.parquet
-          if [ -d "data" ]; then
-            mkdir -p site/data
-            cp -r data/. site/data/
-            # Manifest entries are paths relative to data/, e.g.:
-            #   shiny_content/source=1/part-000.parquet
-            (cd site && find data -type f -name '*.parquet' -print | sed 's|^data/||' > data/manifest.txt)
-
-            echo "Parquet files injected: $(wc -l < site/data/manifest.txt)"
-            head -n 5 site/data/manifest.txt
-          else
-            echo "::warning::No data/ directory found in repo root; app will have nothing to fetch."
-          fi
-
-          touch site/.nojekyll
+          path: 'site'
 
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
-          force_orphan: true
+        id: deployment
+        uses: actions/deploy-pages@v4
