@@ -37,7 +37,7 @@ jobs:
 
             - name: Export Shinylive app
               run: |
-                  shinylive export . _site
+                  shinylive export dashboard _site
 
             - name: Upload Pages artifact
               uses: actions/upload-pages-artifact@v3
