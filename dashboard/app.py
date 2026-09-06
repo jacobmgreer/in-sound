@@ -2,7 +2,8 @@ import os
 import pathlib
 import urllib.request
 import duckdb
-import pandas as import micropip await micropip.install("shiny")
+import pandas as 
+import micropip await micropip.install("shiny")
 from shiny import App, reactive, render, ui
 
 # =============================================================================
