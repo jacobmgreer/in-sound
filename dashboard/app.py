@@ -9,7 +9,7 @@ from shiny import App, reactive, render, ui
 # CONFIGURATION & PATHS
 # =============================================================================
 
-IS_SHINYLIVE = "emscripten" in os.sys.platform.lower() or bool(os.getenv("IN_SHINYLIVE"))
+IS_SHINYLIVE = "emscripten" in sys.platform.lower() or bool(os.getenv("IN_SHINYLIVE"))
 DATA_DIR = "data" if not IS_SHINYLIVE else "."
 
 N_PARQUET_FILES = 10
