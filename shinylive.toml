@@ -3,3 +3,6 @@ files = ["dashboard/", "requirements.txt"]
 
 [application]
 path = "dashboard"
+
+[pyodide]
+packages = ["shiny", "duckdb", "pandas", "scipy", "numpy"]
