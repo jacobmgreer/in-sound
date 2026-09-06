@@ -1,2 +1,4 @@
 shiny
 shinylive
+duckdb
+pandas
