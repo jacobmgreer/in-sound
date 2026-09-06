@@ -26,27 +26,17 @@ IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
 DATA_DIR <- if (IS_SHINYLIVE) "main" else "../data"
 
 # ── Sharded layout ────────────────────────────────────────────────────────────
-# Content and creators now live in the SAME files — identical columns and
-# bitmasks — discriminated by the `type` column:
-#     type = 1  → content
-#     type = 2  → creator
-# The export is split into N_PARQUET_FILES shards named big_sight_0.parquet,
-# big_sight_1.parquet, … Local dev reads them straight from DATA_DIR; Shinylive
-# fetches each shard and unions them into a single DuckDB table (nc_data).
 N_PARQUET_FILES <- 10
 PARQUET_FILES <- function() {
   file.path(DATA_DIR, sprintf("big_sound_%d.parquet", seq_len(N_PARQUET_FILES) - 1))
 }
 
 # Where Shinylive fetches the 10 shards.
-#
-# DEFAULT: same-origin
-# OVERRIDE: set NITRATE_PARQUET_BASE_URL
-# Local dev ignores all of this entirely and reads DATA_DIR from disk.
-# PARQUET_BASE_URL_ENV <- "NITRATE_PARQUET_BASE_URL"
-# Point to your Hugging Face repository raw URL path
-NITRATE_PARQUET_BASE_URL = "https://huggingface.co/datasets/jacobmgreer/in-sound/resolve")
+# Un-commented to ensure parquet_base_url() resolves correctly
+PARQUET_BASE_URL_ENV <- "NITRATE_PARQUET_BASE_URL"
 
+# Removed stray closing parenthesis
+NITRATE_PARQUET_BASE_URL <- "https://huggingface.co/datasets/jacobmgreer/in-sound/resolve"
 
 TYPE_CONTENT <- 1L
 TYPE_CREATOR <- 2L
@@ -81,34 +71,17 @@ sql_int_in <- function(v) paste0("(", paste(as.integer(v), collapse = ", "), ")"
 
 open_con <- function() {
   con <- dbConnect(duckdb(), dbdir = ":memory:", read_only = FALSE)
-  # DuckDB-Wasm is single-threaded by default (multithreading needs COOP/CEOP
-  # headers, which GitHub Pages does not send), so only set this natively.
-  if (!IS_SHINYLIVE) dbExecute(con, "PRAGMA threads=6;")
+  
+  if (!IS_SHINYLIVE) {
+    dbExecute(con, "PRAGMA threads=6;")
+    # Explicit memory bound for local execution to prevent OOM
+    dbExecute(con, "PRAGMA memory_limit='4GB';")
+  }
+  
   dbExecute(con, "SET preserve_insertion_order = false;")
   con
 }
 
-safe_query <- function(con, sql, fallback = data.frame()) {
-  tryCatch({
-    df <- dbGetQuery(con, sql)
-    for (col in names(df)) {
-      if (inherits(df[[col]], "integer64")) df[[col]] <- as.numeric(df[[col]])
-    }
-    df
-  }, error = function(e) {
-    message("[nitrate-dash] ", conditionMessage(e))
-    fallback
-  })
-}
-
-run_sql <- function(con, sql) {
-  safe_query(con, sql)
-}
-
-check_files <- function() {
-  files <- PARQUET_FILES()
-  basename(files[!file.exists(files)])
-}
 
 # =============================================================================
 # SHINYLIVE DATA FETCH — pull the shard parquets into the webR filesystem
